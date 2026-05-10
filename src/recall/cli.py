@@ -1,4 +1,4 @@
-"""Recall CLI — `recall serve` and `recall status`."""
+"""Recall CLI — `recall serve`, `recall status`, `recall create-token`."""
 
 from __future__ import annotations
 
@@ -25,12 +25,19 @@ def main() -> None:
     status = subparsers.add_parser("status", help="Show database stats.")
     status.add_argument("--db", default="recall.db")
 
+    # create-token
+    ct = subparsers.add_parser("create-token", help="Generate an API token for a user.")
+    ct.add_argument("user_id", help="User ID to associate with this token (any string).")
+    ct.add_argument("--db", default="recall.db", help="Path to SQLite database.")
+
     args = parser.parse_args()
 
     if args.command == "serve":
         _cmd_serve(args)
     elif args.command == "status":
         asyncio.run(_cmd_status(args))
+    elif args.command == "create-token":
+        asyncio.run(_cmd_create_token(args))
 
 
 def _cmd_serve(args: argparse.Namespace) -> None:
@@ -51,6 +58,43 @@ def _cmd_serve(args: argparse.Namespace) -> None:
         port=args.port,
         reload=args.reload,
     )
+
+
+async def _cmd_create_token(args: argparse.Namespace) -> None:
+    import os
+    import secrets
+    import uuid
+    from pathlib import Path
+
+    os.environ.setdefault("RECALL_DB_PATH", args.db)
+
+    db_path = Path(args.db)
+    if not db_path.exists():
+        print(f"Database not found: {db_path}")
+        print("Run 'recall serve' first to initialize the database, then create a token.")
+        sys.exit(1)
+
+    from recall.db.connection import set_db_path
+    from recall.security import hash_token
+    import aiosqlite
+
+    set_db_path(db_path)
+
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hash_token(raw_token)
+    token_id = str(uuid.uuid4())
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO api_tokens (id, token_hash, user_id, revoked) VALUES (?, ?, ?, 0)",
+            (token_id, token_hash, args.user_id),
+        )
+        await db.commit()
+
+    print(f"Token created for user: {args.user_id}")
+    print(f"\n  Bearer {raw_token}\n")
+    print("Store this token securely — it will not be shown again.")
+    print("Add it to your MCP client as: Authorization: Bearer <token>")
 
 
 async def _cmd_status(args: argparse.Namespace) -> None:

@@ -37,11 +37,25 @@ pip install "recall-memory[postgres]"
 ## Quick start
 
 ```bash
-# Start the MCP server
-recall serve --host 0.0.0.0 --port 8000
+# 1. Set your Anthropic API key (used for memory extraction)
+export ANTHROPIC_API_KEY=sk-ant-...
 
-# Check status
-recall status
+# 2. Start the server once to initialize the database
+recall serve --port 8000 &
+
+# 3. Create an API token for your user
+recall create-token my-user-id
+
+#    Output:
+#      Token created for user: my-user-id
+#
+#        Bearer <token>
+#
+#      Store this token securely — it will not be shown again.
+
+# 4. Stop the background server and restart normally
+kill %1
+recall serve --port 8000
 ```
 
 Add to your MCP client (Claude Desktop example):
@@ -111,10 +125,19 @@ pip install -e ".[dev]"
 pytest tests/
 ```
 
+## Environment variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `ANTHROPIC_API_KEY` | Yes | — | Used by the extraction worker to classify memories via Claude |
+| `RECALL_DB_PATH` | No | `recall.db` | Path to the SQLite database file |
+
+Copy `.env.example` to `.env` and fill in your values, or export them directly.
+
 ## Versions
 
-- **v0.1** (current): SQLite + BM25 search + 5 MCP tools. Extraction is stubbed — stores raw text.
-- **v0.2** (Memory series): Full LLM extraction, vector embeddings, hybrid RRF search, Postgres support.
+- **v0.1** (current): SQLite + BM25 search + 5 MCP tools. LLM extraction via Claude Haiku — classifies conversation text into typed memories (fact, preference, decision, procedure).
+- **v0.2** (Memory series): Vector embeddings, hybrid BM25+vector RRF search, Postgres support, memory decay + contradiction resolution.
 
 ## License
 

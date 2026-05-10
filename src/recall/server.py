@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
+import math
 import uuid
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, AsyncIterator
 
 import aiosqlite
 from fastmcp import FastMCP
@@ -15,10 +19,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from recall.db.connection import get_db_path, init_db
+from recall.logging import LoggingMiddleware
 from recall.security import hash_token, validate_tool_descriptions
 from recall.worker import ExtractionWorker
 
-mcp = FastMCP("recall")
+logger = logging.getLogger(__name__)
 
 user_id_ctx: ContextVar[str] = ContextVar("user_id", default="")
 extraction_worker: ExtractionWorker | None = None
@@ -28,6 +33,9 @@ extraction_worker: ExtractionWorker | None = None
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Any) -> Any:
+        # Agent Card is publicly discoverable — no auth required
+        if request.url.path.startswith("/.well-known"):
+            return await call_next(request)
         auth = request.headers.get("Authorization", "")
         token = auth.removeprefix("Bearer ").strip()
         user_id = await _validate_token(token)
@@ -54,33 +62,62 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
-@mcp.on_startup
-async def startup() -> None:
+@asynccontextmanager
+async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
     global extraction_worker
     await init_db()
     _validate_server_descriptions()
     extraction_worker = ExtractionWorker()
     await extraction_worker.start()
-
-
-@mcp.on_shutdown
-async def shutdown() -> None:
+    await _recover_orphaned_operations()
+    yield
     if extraction_worker:
         await extraction_worker.stop()
 
 
+async def _recover_orphaned_operations() -> None:
+    """Mark any queued/processing operations left over from a prior crash as failed."""
+    async with aiosqlite.connect(get_db_path()) as db:
+        cursor = await db.execute(
+            "UPDATE operations SET status = 'failed', updated_at = datetime('now') "
+            "WHERE status IN ('queued', 'processing')"
+        )
+        await db.commit()
+    if cursor.rowcount:
+        logger.warning(
+            "startup_orphan_recovery",
+            extra={"count": cursor.rowcount},
+        )
+
+
 def _validate_server_descriptions() -> None:
     """Validate all tool descriptions against poisoning patterns. Fail fast."""
-    tool_descriptions = {
-        name: (tool.description or "") for name, tool in mcp._tools.items()
+    tool_functions = [
+        store_memory, search_memories, inspect_memories,
+        delete_memory, get_memory_stats,
+    ]
+    descriptions = {
+        f.__name__: (f.__doc__ or "").split("\n")[0].strip()
+        for f in tool_functions
     }
-    validate_tool_descriptions(tool_descriptions)
+    validate_tool_descriptions(descriptions)
+
+
+# ── MCP server ────────────────────────────────────────────────────────────────
+
+mcp = FastMCP("recall", lifespan=_lifespan)
 
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def store_memory(text: str, topic: str, idempotency_key: str) -> dict:
+async def store_memory(
+    text: str,
+    topic: str,
+    idempotency_key: str,
+    session_id: str = "",
+    agent_id: str = "",
+) -> dict:
     """Store conversation messages for background memory extraction.
     Returns immediately — extraction runs async. Safe to retry with the same key."""
     user_id = user_id_ctx.get()
@@ -101,9 +138,14 @@ async def store_memory(text: str, topic: str, idempotency_key: str) -> dict:
         await db.commit()
 
     if extraction_worker:
-        await extraction_worker.enqueue(
-            {"job_id": job_id, "user_id": user_id, "text": text, "topic": topic}
-        )
+        await extraction_worker.enqueue({
+            "job_id": job_id,
+            "user_id": user_id,
+            "text": text,
+            "topic": topic,
+            "session_id": session_id,
+            "agent_id": agent_id,
+        })
 
     return {"status": "ok", "data": {"queued": True, "job_id": job_id}, "error": None}
 
@@ -122,7 +164,7 @@ async def search_memories(
             "code": "INVALID_PARAM",
         }
     user_id = user_id_ctx.get()
-    results = await _bm25_search(user_id, query, min(limit, 50))
+    results = await _hybrid_search(user_id, query, min(limit, 50), recency_weight)
     return {"status": "ok", "data": {"results": results, "total": len(results)}, "error": None}
 
 
@@ -230,40 +272,148 @@ async def _validate_token(token: str) -> str | None:
     return rows[0][0] if rows else None
 
 
-async def _bm25_search(user_id: str, query: str, limit: int) -> list[dict]:
-    """BM25 keyword search. v0.1 baseline — RRF + vector upgrade in Memory series."""
+def _parse_ts(ts: str) -> datetime:
+    """Parse ISO8601 timestamp from SQLite, ensuring UTC timezone."""
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _bm25_ranks(query: str, texts: list[str]) -> list[int] | None:
+    """Return per-document BM25 rank (1-based). None if rank_bm25 not installed.
+
+    Uses BM25Plus over BM25Okapi: BM25Okapi IDF collapses to 0 with N=2 when a term
+    appears in exactly one document (log(1.5/1.5)=0), causing all scores to be 0.
+    BM25Plus adds a lower-bound delta that keeps scores positive for small corpora.
+    """
+    try:
+        from rank_bm25 import BM25Plus
+        tokenized = [t.lower().split() for t in texts]
+        bm25 = BM25Plus(tokenized)
+        scores = list(bm25.get_scores(query.lower().split()))
+        # rank = position in descending score order (0-based → 1-based)
+        order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        ranks = [0] * len(scores)
+        for rank, idx in enumerate(order):
+            ranks[idx] = rank + 1  # 1-based
+        # Docs with zero BM25Plus score have no query term overlap — push to worst rank
+        for i, s in enumerate(scores):
+            if s == 0:
+                ranks[i] = len(scores) + 1
+        return ranks
+    except ImportError:
+        return None
+
+
+def _dense_ranks(query: str, texts: list[str]) -> list[int] | None:
+    """Return per-document cosine similarity rank (1-based). None if model unavailable."""
+    from recall.embeddings import embed, embed_query
+    q_vec = embed_query(query)
+    if q_vec is None:
+        return None
+    doc_vecs = embed(texts)
+    if doc_vecs is None:
+        return None
+    from recall.embeddings import cosine_scores
+    sims = cosine_scores(q_vec, doc_vecs)
+    order = sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)
+    ranks = [0] * len(sims)
+    for rank, idx in enumerate(order):
+        ranks[idx] = rank + 1
+    return ranks
+
+
+def _rrf_fuse(
+    bm25_ranks: list[int] | None,
+    dense_ranks: list[int] | None,
+    k: int = 60,
+) -> list[float]:
+    """Reciprocal Rank Fusion. Returns a score per document (higher = better match)."""
+    n = len(bm25_ranks or dense_ranks or [])
+    if n == 0:
+        return []
+    worst = n + 1
+    scores = [0.0] * n
+    for ranks in (bm25_ranks, dense_ranks):
+        if ranks is None:
+            continue
+        for i, r in enumerate(ranks):
+            if r <= n:  # skip placeholder worst-rank docs
+                scores[i] += 1.0 / (k + r)
+    return scores
+
+
+async def _hybrid_search(
+    user_id: str, query: str, limit: int, recency_weight: float = 0.3
+) -> list[dict]:
+    """BM25 + dense RRF(k=60) hybrid retrieval with 4-component scoring.
+
+    Components (Park et al. 2023 + MemoryBank):
+      0.50 · RRF(BM25, cosine)
+      0.25 · exp(-Δt / (1 + access_count))   — recency with strength modifier
+      0.15 · importance
+      0.10 · log(1+ac) / log(1+max_ac)       — access frequency (strength)
+    """
     async with aiosqlite.connect(get_db_path()) as db:
         rows = await db.execute_fetchall(
-            "SELECT id, text, topic, importance, type, created_at "
+            "SELECT id, text, topic, importance, type, created_at, access_count "
             "FROM memories WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit * 5),  # fetch more than needed for in-memory BM25 ranking
+            (user_id, limit * 5),
         )
 
     if not rows:
         return []
 
     memories = [
-        {"id": r[0], "text": r[1], "topic": r[2], "importance": r[3], "type": r[4], "created_at": r[5]}
+        {
+            "id": r[0], "text": r[1], "topic": r[2], "importance": r[3],
+            "type": r[4], "created_at": r[5], "access_count": r[6] or 0,
+        }
         for r in rows
     ]
+    texts = [m["text"] for m in memories]
 
-    try:
-        from rank_bm25 import BM25Okapi
+    bm25_r = _bm25_ranks(query, texts)
+    dense_r = _dense_ranks(query, texts)
+    rrf = _rrf_fuse(bm25_r, dense_r, k=60)
 
-        tokenized = [m["text"].lower().split() for m in memories]
-        bm25 = BM25Okapi(tokenized)
-        scores = bm25.get_scores(query.lower().split())
-        ranked = sorted(zip(scores, memories), key=lambda x: x[0], reverse=True)
-        return [m for _, m in ranked[:limit] if _ > 0]
-    except ImportError:
-        return memories[:limit]
+    now = datetime.now(timezone.utc)
+    max_ac = max((m["access_count"] for m in memories), default=1) or 1
+
+    scored: list[tuple[float, dict]] = []
+    for i, m in enumerate(memories):
+        if rrf[i] == 0:
+            continue  # no BM25 or dense signal — suppress from results
+        age_days = (now - _parse_ts(m["created_at"])).total_seconds() / 86400
+        ac = m["access_count"]
+        recency = math.exp(-age_days / (1 + ac))
+        strength = math.log(1 + ac) / math.log(1 + max_ac)
+        # Scale recency coefficient by user's recency_weight param (baseline = 0.3)
+        recency_coeff = 0.25 * (recency_weight / 0.3) if recency_weight > 0 else 0.0
+        score = (
+            0.50 * rrf[i]
+            + recency_coeff * recency
+            + 0.15 * (m.get("importance") or 0.5)
+            + 0.10 * strength
+        )
+        scored.append((score, m))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [m for _, m in scored[:limit]]
 
 
-# ── WSGI app factory ──────────────────────────────────────────────────────────
+# ── ASGI app factory ──────────────────────────────────────────────────────────
 
 def create_app():
-    """Return the Starlette app with all middleware wired. Used by uvicorn."""
-    app = mcp.streamable_http_app()
+    """Return the Starlette app with all middleware and A2A routes wired. Used by uvicorn."""
+    from recall.a2a import create_a2a_router, create_well_known_router
+
+    app = mcp.http_app(transport="streamable-http")
+    app.mount("/a2a", create_a2a_router(user_id_ctx))
+    app.mount("/.well-known", create_well_known_router())
+    # Starlette applies middleware in reverse order — LoggingMiddleware runs outermost (sees full duration)
+    app.add_middleware(LoggingMiddleware, user_id_ctx=user_id_ctx)
     app.add_middleware(TimeoutMiddleware)
     app.add_middleware(BearerAuthMiddleware)
     return app

@@ -12,6 +12,8 @@ from datetime import datetime
 from typing import Any, Literal
 
 import aiosqlite
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
 from recall.db.connection import get_db_path
 
@@ -79,20 +81,42 @@ async def insert_tool_call_record(record: ToolCallRecord) -> None:
         await db.commit()
 
 
-class LoggingMiddleware:
-    """Wraps every tool call with a ToolCallRecord. Logs in finally — success AND error."""
+class LoggingMiddleware(BaseHTTPMiddleware):
+    """Creates one ToolCallRecord per MCP tool call. Runs in finally — logs success AND errors.
 
-    def __init__(self, user_id_ctx: ContextVar[str]) -> None:
+    Only logs requests where method == "tools/call". Health checks and
+    other MCP protocol messages are passed through without logging.
+    """
+
+    def __init__(self, app: Any, user_id_ctx: ContextVar[str]) -> None:
+        super().__init__(app)
         self._user_id_ctx = user_id_ctx
 
-    async def __call__(self, tool_name: str, inputs: Any, call_next: Any) -> Any:
+    async def dispatch(self, request: Request, call_next: Any) -> Any:
+        body = b""
+        tool_name = ""
+        inputs_data: Any = {}
+
+        try:
+            body = await request.body()
+            payload = json.loads(body) if body else {}
+            # MCP Streamable HTTP: {"method": "tools/call", "params": {"name": "...", "arguments": {...}}}
+            if payload.get("method") == "tools/call":
+                tool_name = payload.get("params", {}).get("name", "unknown")
+                inputs_data = payload.get("params", {}).get("arguments", {})
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        if not tool_name:
+            return await call_next(request)
+
         start = time.monotonic()
         status: Literal["success", "error", "timeout"] = "success"
         error_code: str | None = None
 
         try:
-            result = await call_next()
-            return result
+            response = await call_next(request)
+            return response
         except TimeoutError:
             status = "timeout"
             error_code = "TOOL_TIMEOUT"
@@ -110,7 +134,7 @@ class LoggingMiddleware:
                 tool_name=tool_name,
                 user_id=self._user_id_ctx.get(),
                 session_id=session_id_ctx.get(),
-                inputs_hash=hash_inputs(inputs),
+                inputs_hash=hash_inputs(inputs_data),
                 status=status,
                 error_code=error_code,
                 duration_ms=duration_ms,

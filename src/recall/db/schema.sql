@@ -32,9 +32,18 @@ CREATE TABLE IF NOT EXISTS memories (
     created_at      TEXT NOT NULL,
     last_accessed   TEXT,
     access_count    INTEGER DEFAULT 0,
-    decay_score     REAL,                   -- computed in Memory series
-    superseded_by   TEXT,                   -- contradiction resolution in Memory series
-    embedding       BLOB                    -- added when pgvector available
+    decay_score     REAL,
+    superseded_by   TEXT,                   -- FK to memories.id that superseded this
+    embedding       BLOB,                   -- L2-normalized float32 vector (BAAI/bge-small-en-v1.5)
+    -- v2: structured fact fields
+    entity          TEXT,                   -- subject: "user", "project-x", "tool-y"
+    attribute       TEXT,                   -- property: "preferred_language", "works_at"
+    value           TEXT,                   -- value: "Python", "Acme Corp"
+    valid_from      TEXT,                   -- ISO8601 — when fact became true (default: created_at)
+    valid_until     TEXT,                   -- ISO8601 — NULL means still active; set on contradiction
+    session_id      TEXT,                   -- conversation that produced this memory
+    agent_id        TEXT,                   -- which agent stored it
+    linked_ids      TEXT                    -- JSON array ["id1","id2"] of related memories
 );
 
 -- ------------------------------------------------------------------ --
@@ -68,6 +77,10 @@ CREATE INDEX IF NOT EXISTS idx_memories_user_type
 
 CREATE INDEX IF NOT EXISTS idx_memories_created
     ON memories(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_memories_entity_attr
+    ON memories(user_id, entity, attribute)
+    WHERE valid_until IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_user_session
     ON tool_call_records(user_id, session_id);
