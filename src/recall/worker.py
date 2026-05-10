@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import aiosqlite
@@ -129,7 +129,8 @@ class ExtractionWorker:
 
         async with aiosqlite.connect(get_db_path()) as db:
             await db.execute(
-                "UPDATE operations SET status = 'processing' WHERE id = ?",
+                "UPDATE operations SET status = 'processing', updated_at = datetime('now') "
+                "WHERE id = ?",
                 (job_id,),
             )
             await db.commit()
@@ -172,7 +173,8 @@ class ExtractionWorker:
                     ),
                 )
             await db.execute(
-                "UPDATE operations SET status = 'complete' WHERE id = ?",
+                "UPDATE operations SET status = 'complete', updated_at = datetime('now') "
+                "WHERE id = ?",
                 (job_id,),
             )
             await db.commit()
@@ -219,7 +221,7 @@ class ExtractionWorker:
                 f"{raw_content[:200]!r}"
             )
 
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         memories: list[dict] = []
 
         for item in extracted:
@@ -296,7 +298,7 @@ def _extract_stub_fallback(
     user_id: str, text: str, topic: str, source_session: str
 ) -> list[dict]:
     """Fallback stub — returns the raw text as a single fact memory when LLM extraction fails."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     return [
         {
             "id": str(uuid.uuid4()),

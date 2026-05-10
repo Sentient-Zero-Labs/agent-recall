@@ -9,7 +9,6 @@ Model: BAAI/bge-small-en-v1.5 — 33M params, <100ms/query on CPU, strong retrie
 from __future__ import annotations
 
 import logging
-import struct
 
 import numpy as np
 

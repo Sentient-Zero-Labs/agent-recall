@@ -80,7 +80,7 @@ async def _recover_orphaned_operations() -> None:
     async with aiosqlite.connect(get_db_path()) as db:
         cursor = await db.execute(
             "UPDATE operations SET status = 'failed', updated_at = datetime('now') "
-            "WHERE status IN ('queued', 'processing')"
+            "WHERE status IN ('queued', 'processing')",
         )
         await db.commit()
     if cursor.rowcount:
@@ -122,20 +122,16 @@ async def store_memory(
     Returns immediately — extraction runs async. Safe to retry with the same key."""
     user_id = user_id_ctx.get()
 
+    job_id = str(uuid.uuid4())
     async with aiosqlite.connect(get_db_path()) as db:
-        existing = await db.execute_fetchall(
-            "SELECT 1 FROM operations WHERE idempotency_key = ?",
-            (idempotency_key,),
-        )
-        if existing:
-            return {"status": "ok", "data": {"queued": False, "cached": True}, "error": None}
-
-        job_id = str(uuid.uuid4())
-        await db.execute(
-            "INSERT INTO operations (id, idempotency_key, user_id, status) VALUES (?,?,?,'queued')",
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO operations (id, idempotency_key, user_id, status) "
+            "VALUES (?,?,?,'queued')",
             (job_id, idempotency_key, user_id),
         )
         await db.commit()
+        if cursor.rowcount == 0:
+            return {"status": "ok", "data": {"queued": False, "cached": True}, "error": None}
 
     if extraction_worker:
         await extraction_worker.enqueue({
@@ -177,11 +173,13 @@ async def inspect_memories(limit: int = 20, offset: int = 0) -> dict:
     async with aiosqlite.connect(get_db_path()) as db:
         rows = await db.execute_fetchall(
             "SELECT id, text, topic, importance, type, created_at "
-            "FROM memories WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            "FROM memories WHERE user_id = ? AND valid_until IS NULL "
+            "ORDER BY created_at DESC LIMIT ? OFFSET ?",
             (user_id, limit, offset),
         )
         count = await db.execute_fetchall(
-            "SELECT COUNT(*) FROM memories WHERE user_id = ?", (user_id,)
+            "SELECT COUNT(*) FROM memories WHERE user_id = ? AND valid_until IS NULL",
+            (user_id,),
         )
         total = count[0][0]
 
@@ -239,7 +237,8 @@ async def get_memory_stats() -> dict:
 
     async with aiosqlite.connect(get_db_path()) as db:
         by_type = await db.execute_fetchall(
-            "SELECT type, COUNT(*) FROM memories WHERE user_id = ? GROUP BY type",
+            "SELECT type, COUNT(*) FROM memories "
+            "WHERE user_id = ? AND valid_until IS NULL GROUP BY type",
             (user_id,),
         )
         pending = await db.execute_fetchall(
@@ -308,14 +307,13 @@ def _bm25_ranks(query: str, texts: list[str]) -> list[int] | None:
 
 def _dense_ranks(query: str, texts: list[str]) -> list[int] | None:
     """Return per-document cosine similarity rank (1-based). None if model unavailable."""
-    from recall.embeddings import embed, embed_query
+    from recall.embeddings import cosine_scores, embed, embed_query
     q_vec = embed_query(query)
     if q_vec is None:
         return None
     doc_vecs = embed(texts)
     if doc_vecs is None:
         return None
-    from recall.embeddings import cosine_scores
     sims = cosine_scores(q_vec, doc_vecs)
     order = sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)
     ranks = [0] * len(sims)
@@ -333,13 +331,12 @@ def _rrf_fuse(
     n = len(bm25_ranks or dense_ranks or [])
     if n == 0:
         return []
-    worst = n + 1
     scores = [0.0] * n
     for ranks in (bm25_ranks, dense_ranks):
         if ranks is None:
             continue
         for i, r in enumerate(ranks):
-            if r <= n:  # skip placeholder worst-rank docs
+            if r <= n:  # r == n+1 means zero BM25 signal — skip
                 scores[i] += 1.0 / (k + r)
     return scores
 
@@ -358,7 +355,8 @@ async def _hybrid_search(
     async with aiosqlite.connect(get_db_path()) as db:
         rows = await db.execute_fetchall(
             "SELECT id, text, topic, importance, type, created_at, access_count "
-            "FROM memories WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            "FROM memories WHERE user_id = ? AND valid_until IS NULL "
+            "ORDER BY created_at DESC LIMIT ?",
             (user_id, limit * 5),
         )
 
@@ -381,6 +379,13 @@ async def _hybrid_search(
     now = datetime.now(timezone.utc)
     max_ac = max((m["access_count"] for m in memories), default=1) or 1
 
+    # Weights interpolate linearly with recency_weight and always sum to 1.0.
+    # recency_weight=0 → relevance-dominant; recency_weight=1 → recency-dominant.
+    w_rrf      = 0.70 - 0.30 * recency_weight   # 0.70 → 0.40
+    w_recency  = 0.40 * recency_weight           # 0.00 → 0.40
+    w_import   = 0.20 - 0.10 * recency_weight    # 0.20 → 0.10
+    w_strength = 0.10                            # fixed
+
     scored: list[tuple[float, dict]] = []
     for i, m in enumerate(memories):
         if rrf[i] == 0:
@@ -389,13 +394,11 @@ async def _hybrid_search(
         ac = m["access_count"]
         recency = math.exp(-age_days / (1 + ac))
         strength = math.log(1 + ac) / math.log(1 + max_ac)
-        # Scale recency coefficient by user's recency_weight param (baseline = 0.3)
-        recency_coeff = 0.25 * (recency_weight / 0.3) if recency_weight > 0 else 0.0
         score = (
-            0.50 * rrf[i]
-            + recency_coeff * recency
-            + 0.15 * (m.get("importance") or 0.5)
-            + 0.10 * strength
+            w_rrf      * rrf[i]
+            + w_recency  * recency
+            + w_import   * (m.get("importance") or 0.5)
+            + w_strength * strength
         )
         scored.append((score, m))
 
