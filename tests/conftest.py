@@ -8,9 +8,14 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from dotenv import load_dotenv
 
 from recall.client import MemoryClient
 from recall.db.connection import set_db_path
+
+# Load .env from the project root so ANTHROPIC_API_KEY is available to live tests.
+# override=False means shell exports take precedence over the file.
+load_dotenv(Path(__file__).parent.parent / ".env", override=False)
 
 
 @pytest.fixture

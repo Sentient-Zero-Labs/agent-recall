@@ -1,0 +1,20 @@
+services:
+  recall:
+    build: .
+    ports:
+      - "8678:8678"
+    volumes:
+      - ./data:/data
+    env_file:
+      - .env
+    environment:
+      RECALL_DB_PATH: /data/recall.db
+    restart: unless-stopped
+    healthcheck:
+      # Agent Card is public — no token needed. Checks the server is up.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8678/.well-known/agent-card.json')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
