@@ -1,7 +1,8 @@
 """End-to-end tests against a live uvicorn process.
 
 Spins up `recall serve` as a subprocess on port 8678, creates a real DB and
-auth token, then exercises MCP tools and the A2A endpoint over HTTP.
+auth token via `recall create-token`, then exercises MCP tools and the A2A
+endpoint over HTTP.
 
 Requirements:
   - ANTHROPIC_API_KEY env var (used by the server for background extraction)
@@ -17,26 +18,21 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import secrets
+import shutil
 import subprocess
-import sys
-import tempfile
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
 
-import aiosqlite
 import httpx
 import pytest
 import pytest_asyncio
 
-from recall.db.connection import set_db_path
-from recall.security import hash_token
-
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-_PORT = 8678
+_PORT = 18678
 _BASE = f"http://localhost:{_PORT}"
 _MCP_PROTO = "2024-11-05"
 _STARTUP_TIMEOUT = 20   # seconds to wait for the server to accept connections
@@ -51,6 +47,19 @@ _needs_api = pytest.mark.skipif(
 )
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _recall_bin() -> str:
+    """Resolve the `recall` binary from .venv or PATH."""
+    venv_bin = Path(__file__).parent.parent / ".venv" / "bin" / "recall"
+    if venv_bin.exists():
+        return str(venv_bin)
+    found = shutil.which("recall")
+    if found:
+        return found
+    pytest.skip("recall CLI not found — run `pip install -e .` first")
+
+
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 @pytest.fixture(scope="session")
@@ -60,45 +69,26 @@ def e2e_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="session")
-def e2e_token(e2e_db: Path) -> str:
-    """Raw bearer token seeded into the E2E database synchronously."""
-    raw = secrets.token_urlsafe(32)
-    token_hash = hash_token(raw)
-    token_id = str(uuid.uuid4())
-
-    import sqlite3
-    # DB may not exist yet — the server will create it on startup.
-    # We seed the token AFTER the server has initialized the schema.
-    # Return the raw token; the server fixture seeds it.
-    return raw
-
-
-@pytest.fixture(scope="session")
-def server_process(e2e_db: Path, e2e_token: str):
-    """Start a real uvicorn process on port 8678, yield it, then tear it down."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
+def server_process(e2e_db: Path):
+    """Start a real uvicorn process on port 8678, create an auth token via CLI,
+    yield (proc, raw_token), then tear down."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
         pytest.skip("ANTHROPIC_API_KEY not set")
 
+    recall_bin = _recall_bin()
     env = {**os.environ, "RECALL_DB_PATH": str(e2e_db)}
-
-    import shutil
-    recall_bin = shutil.which("recall")
-    if not recall_bin:
-        pytest.skip("recall CLI not found — run `pip install -e .` first")
 
     proc = subprocess.Popen(
         [recall_bin, "serve", "--host", "127.0.0.1", "--port", str(_PORT), "--db", str(e2e_db)],
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=None,  # let server logs flow to terminal so pytest -s shows them
     )
 
-    # Wait until the server is accepting requests
+    # Wait until the server is accepting HTTP requests
     deadline = time.time() + _STARTUP_TIMEOUT
     while time.time() < deadline:
         try:
-            import urllib.request
             urllib.request.urlopen(f"{_BASE}/.well-known/agent-card.json", timeout=2)
             break
         except Exception:
@@ -112,24 +102,61 @@ def server_process(e2e_db: Path, e2e_token: str):
             f"stderr: {err.decode()[-2000:]}"
         )
 
-    # Seed the auth token now that the schema exists
+    # Wait for init_db() to finish creating the schema.
+    # The .well-known endpoint may respond before lifespan completes.
     import sqlite3
-    token_hash = hash_token(e2e_token)
-    conn = sqlite3.connect(str(e2e_db))
-    conn.execute(
-        "INSERT OR IGNORE INTO api_tokens (id, token_hash, user_id, revoked) VALUES (?,?,?,0)",
-        (str(uuid.uuid4()), token_hash, "e2e-user"),
-    )
-    conn.commit()
-    conn.close()
+    schema_deadline = time.time() + _STARTUP_TIMEOUT
+    while time.time() < schema_deadline:
+        try:
+            _conn = sqlite3.connect(str(e2e_db))
+            _conn.execute("SELECT 1 FROM api_tokens LIMIT 1")
+            _conn.close()
+            break
+        except sqlite3.OperationalError:
+            try:
+                _conn.close()
+            except Exception:
+                pass
+            time.sleep(_POLL_INTERVAL)
+    else:
+        proc.terminate()
+        pytest.fail(f"DB schema not ready within {_STARTUP_TIMEOUT}s — api_tokens missing")
 
-    yield proc
+    # Create the auth token using the CLI (same code path as production — aiosqlite,
+    # fully committed before returning). Avoids raw sqlite3 WAL visibility issues.
+    token_result = subprocess.run(
+        [recall_bin, "create-token", "e2e-user", "--db", str(e2e_db)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    raw_token: str | None = None
+    for line in token_result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Bearer "):
+            raw_token = stripped.removeprefix("Bearer ").strip()
+            break
+    if not raw_token:
+        proc.terminate()
+        pytest.fail(
+            f"recall create-token did not produce a token.\n"
+            f"stdout: {token_result.stdout}\nstderr: {token_result.stderr}"
+        )
+
+    yield proc, raw_token
 
     proc.terminate()
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
+
+
+@pytest.fixture(scope="session")
+def e2e_token(server_process) -> str:
+    """The bearer token for the live E2E server (extracted from server_process)."""
+    _, token = server_process
+    return token
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -209,21 +236,19 @@ class TestE2EBasic:
 
     def test_agent_card_is_public(self, server_process):
         """GET /.well-known/agent-card.json requires no token."""
-        import urllib.request
         with urllib.request.urlopen(f"{_BASE}/.well-known/agent-card.json") as r:
             card = json.loads(r.read())
         assert card["name"] == "recall"
         assert any(s["id"] == "consolidate_memories" for s in card.get("skills", []))
 
     def test_no_token_returns_401(self, server_process):
-        import urllib.request, urllib.error
         req = urllib.request.Request(
             f"{_BASE}/mcp",
             data=b"{}",
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with pytest.raises(urllib.error.HTTPError) as exc_info:
+        with pytest.raises(urllib.request.HTTPError) as exc_info:
             urllib.request.urlopen(req)
         assert exc_info.value.code == 401
 
@@ -314,24 +339,6 @@ class TestE2EMcpTools:
 @_needs_api
 class TestE2EA2A:
     """A2A task lifecycle: create → poll → completed."""
-
-    async def _post(
-        self,
-        client: httpx.AsyncClient,
-        path: str,
-        token: str,
-        body: dict | None = None,
-    ) -> dict:
-        resp = await client.request(
-            "POST" if body is not None else "GET",
-            path,
-            json=body,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-        )
-        return resp
 
     async def test_consolidate_task_lifecycle(self, server_process, e2e_token):
         """Full A2A flow: submit task, poll until terminal state."""

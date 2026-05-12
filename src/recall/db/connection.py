@@ -45,6 +45,28 @@ async def _migrate_v2(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def _migrate_v3(db: aiosqlite.Connection) -> None:
+    """Create a2a_tasks table for persistent A2A task storage (v3)."""
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS a2a_tasks (
+            id          TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'submitted',
+            input       TEXT NOT NULL,
+            output      TEXT,
+            message     TEXT,
+            pending     TEXT,
+            resolution  TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_a2a_user ON a2a_tasks(user_id)"
+    )
+    await db.commit()
+
+
 async def init_db() -> None:
     """Create tables and apply schema. Idempotent — safe to call on every startup."""
     schema = _SCHEMA_PATH.read_text()
@@ -58,6 +80,7 @@ async def init_db() -> None:
         await db.commit()
 
         await _migrate_v2(db)
+        await _migrate_v3(db)
 
 
 def get_db_path() -> Path:

@@ -9,6 +9,7 @@ Task resume: POST /a2a/{task_id}/resume  (for input-required resolution)
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from contextvars import ContextVar
@@ -24,7 +25,7 @@ from recall.worker import _extract_stub_fallback
 
 logger = logging.getLogger(__name__)
 
-# In-memory task store — sufficient for v0.1 (DB persistence in Memory series)
+# Write-through in-memory cache — DB is the source of truth
 _tasks: dict[str, dict[str, Any]] = {}
 
 AGENT_CARD = {
@@ -51,6 +52,58 @@ AGENT_CARD = {
 _NEGATION_TOKENS = frozenset(
     {"not", "no", "never", "stopped", "longer", "changed", "removed", "quit", "dropped"}
 )
+
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+
+async def _db_insert_task(task: dict[str, Any]) -> None:
+    async with aiosqlite.connect(get_db_path()) as db:
+        await db.execute(
+            "INSERT INTO a2a_tasks (id, user_id, status, input, created_at, updated_at) "
+            "VALUES (?, ?, 'submitted', ?, datetime('now'), datetime('now'))",
+            (task["id"], task["user_id"], json.dumps(task["input"])),
+        )
+        await db.commit()
+
+
+async def _db_update_task(task: dict[str, Any]) -> None:
+    async with aiosqlite.connect(get_db_path()) as db:
+        await db.execute(
+            "UPDATE a2a_tasks SET status=?, output=?, message=?, pending=?, resolution=?, "
+            "updated_at=datetime('now') WHERE id=?",
+            (
+                task["status"],
+                json.dumps(task["output"]) if task.get("output") is not None else None,
+                json.dumps(task["message"]) if task.get("message") is not None else None,
+                json.dumps(task["_pending_memories"]) if task.get("_pending_memories") else None,
+                task.get("_resolution"),
+                task["id"],
+            ),
+        )
+        await db.commit()
+
+
+async def _db_load_task(task_id: str) -> dict[str, Any] | None:
+    async with aiosqlite.connect(get_db_path()) as db:
+        rows = await db.execute_fetchall(
+            "SELECT id, user_id, status, input, output, message, pending, resolution "
+            "FROM a2a_tasks WHERE id = ?",
+            (task_id,),
+        )
+    if not rows:
+        return None
+    r = rows[0]
+    return {
+        "id": r[0],
+        "user_id": r[1],
+        "status": r[2],
+        "input": json.loads(r[3]),
+        "output": json.loads(r[4]) if r[4] else None,
+        "message": json.loads(r[5]) if r[5] else None,
+        "_pending_memories": json.loads(r[6]) if r[6] else [],
+        "_resolution": r[7],
+    }
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -95,6 +148,7 @@ async def _create_task(request: Request, user_id_ctx: ContextVar[str]) -> JSONRe
         "output": None,
         "message": None,
     }
+    await _db_insert_task(task)
     _tasks[task_id] = task
 
     asyncio.create_task(_run_consolidation(task_id), name=f"a2a-consolidate-{task_id[:8]}")
@@ -106,12 +160,16 @@ async def _get_task(request: Request) -> JSONResponse:
     task_id = request.path_params["task_id"]
     task = _tasks.get(task_id)
     if not task:
+        task = await _db_load_task(task_id)
+        if task:
+            _tasks[task_id] = task  # populate cache for future polls
+    if not task:
         return JSONResponse({"error": f"Task {task_id!r} not found."}, status_code=404)
     return JSONResponse({
         "id": task["id"],
         "status": task["status"],
         "output": task["output"],
-        "message": task["message"],
+        "message": task.get("message"),
     })
 
 
@@ -141,6 +199,7 @@ async def _resume_task(request: Request) -> JSONResponse:
 
     task["status"] = "working"
     task["_resolution"] = resolution
+    await _db_update_task(task)
     asyncio.create_task(_apply_resolution(task_id), name=f"a2a-resolve-{task_id[:8]}")
     return JSONResponse({"id": task_id, "status": "working"})
 
@@ -154,6 +213,7 @@ async def _run_consolidation(task_id: str) -> None:
         return
 
     task["status"] = "working"
+    await _db_update_task(task)
     user_id = task["user_id"]
     text = task["input"]["text"]
     topic = task["input"]["topic"]
@@ -174,6 +234,7 @@ async def _run_consolidation(task_id: str) -> None:
     if not memories:
         task["status"] = "completed"
         task["output"] = {"memories_stored": 0, "contradictions": []}
+        await _db_update_task(task)
         return
 
     contradictions = await _detect_contradictions(user_id, memories)
@@ -190,6 +251,7 @@ async def _run_consolidation(task_id: str) -> None:
             ),
             "contradictions": contradictions,
         }
+        await _db_update_task(task)
         logger.info(
             "a2a_input_required",
             extra={"task_id": task_id, "contradictions": len(contradictions)},
@@ -199,6 +261,7 @@ async def _run_consolidation(task_id: str) -> None:
     stored = await _bulk_store(memories)
     task["status"] = "completed"
     task["output"] = {"memories_stored": stored, "contradictions": []}
+    await _db_update_task(task)
     logger.info("a2a_completed", extra={"task_id": task_id, "stored": stored})
 
 
@@ -229,6 +292,7 @@ async def _apply_resolution(task_id: str) -> None:
         "resolution_applied": resolution,
         "contradictions": contradictions,
     }
+    await _db_update_task(task)
     logger.info(
         "a2a_resolved",
         extra={"task_id": task_id, "resolution": resolution, "stored": stored},

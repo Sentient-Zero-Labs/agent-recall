@@ -171,16 +171,27 @@ async def search_memories(
     query: str,
     limit: int = 20,
     recency_weight: float = 0.3,
+    mmr_lambda: float = 0.5,
+    score_threshold: float = 0.0,
+    max_tokens: int | None = None,
 ) -> dict:
-    """Search memories using hybrid retrieval (~200-500ms). recency_weight 0-1 upweights recent results."""
+    """Search memories using hybrid retrieval (~200-500ms).
+
+    recency_weight 0-1 upweights recent results.
+    mmr_lambda 0-1: 0=max diversity, 1=pure relevance (default 0.5).
+    score_threshold: drop candidates below this hybrid score (default 0.0 = keep all).
+    max_tokens: trim results to fit within this token budget (None = no limit).
+    """
     if not 0.0 <= recency_weight <= 1.0:
-        return {
-            "status": "error",
-            "error": "recency_weight must be between 0.0 and 1.0.",
-            "code": "INVALID_PARAM",
-        }
+        return {"status": "error", "error": "recency_weight must be between 0.0 and 1.0.", "code": "INVALID_PARAM"}
+    if not 0.0 <= mmr_lambda <= 1.0:
+        return {"status": "error", "error": "mmr_lambda must be between 0.0 and 1.0.", "code": "INVALID_PARAM"}
     user_id = user_id_ctx.get()
-    results = await _hybrid_search(user_id, query, min(limit, 50), recency_weight)
+    results = await _hybrid_search(
+        user_id, query, min(limit, 50), recency_weight, mmr_lambda, score_threshold
+    )
+    if max_tokens is not None:
+        results = _apply_budget(results, max_tokens)
     return {"status": "ok", "data": {"results": results, "total": len(results)}, "error": None}
 
 
@@ -412,13 +423,49 @@ async def consolidate_memories(
     }
 
 
+@mcp.tool()
+async def delete_user_data(confirm: str) -> dict:
+    """Permanently delete ALL data for the current user. Irreversible.
+
+    Pass confirm='DELETE MY DATA' exactly to proceed.
+    Deletes: all memories, A2A tasks, pending operations, and tool-call records.
+    Revokes (does not delete) API tokens so the user knows their auth is gone.
+    """
+    if confirm != "DELETE MY DATA":
+        return {
+            "status": "error",
+            "error": "Pass confirm='DELETE MY DATA' exactly to proceed.",
+            "code": "CONFIRM_REQUIRED",
+        }
+    user_id = user_id_ctx.get()
+    async with aiosqlite.connect(get_db_path()) as db:
+        await db.execute("DELETE FROM memories WHERE user_id = ?", (user_id,))
+        await db.execute("DELETE FROM a2a_tasks WHERE user_id = ?", (user_id,))
+        await db.execute("DELETE FROM operations WHERE user_id = ?", (user_id,))
+        await db.execute(
+            "DELETE FROM tool_call_records WHERE user_id = ? AND tool_name != 'delete_user_data'",
+            (user_id,),
+        )
+        r = await db.execute(
+            "UPDATE api_tokens SET revoked = 1 WHERE user_id = ?", (user_id,)
+        )
+        tokens_revoked = r.rowcount
+        await db.commit()
+    return {
+        "status": "ok",
+        "data": {"tokens_revoked": tokens_revoked},
+        "error": None,
+    }
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 async def _validate_token(token: str) -> str | None:
     if not token:
         return None
     token_hash = hash_token(token)
-    async with aiosqlite.connect(get_db_path()) as db:
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
         rows = await db.execute_fetchall(
             "SELECT user_id FROM api_tokens WHERE token_hash = ? AND revoked = 0",
             (token_hash,),
@@ -475,6 +522,49 @@ def _dense_ranks(query: str, texts: list[str]) -> list[int] | None:
     for rank, idx in enumerate(order):
         ranks[idx] = rank + 1
     return ranks
+
+
+def _mmr_rerank(
+    candidates: list[dict],
+    query_vec: "np.ndarray | None",
+    mmr_lambda: float,
+    limit: int,
+) -> list[dict]:
+    """Max-Marginal Relevance reranking for diversity.
+
+    Iteratively selects the candidate that maximises:
+      mmr_lambda * sim(query, doc) - (1 - mmr_lambda) * max(sim(doc, selected))
+
+    Falls back to candidates[:limit] when embeddings are unavailable.
+    """
+    if query_vec is None or len(candidates) <= limit:
+        return candidates[:limit]
+
+    from recall.embeddings import embed
+    import numpy as np
+
+    doc_vecs = embed([m["text"] for m in candidates])
+    if doc_vecs is None:
+        return candidates[:limit]
+
+    q_sims = (doc_vecs @ query_vec).tolist()
+
+    selected: list[int] = []
+    remaining = list(range(len(candidates)))
+
+    while len(selected) < limit and remaining:
+        best_i, best_score = None, float("-inf")
+        for i in remaining:
+            redundancy = float(np.max(doc_vecs[selected] @ doc_vecs[i])) if selected else 0.0
+            mmr_score = mmr_lambda * q_sims[i] - (1.0 - mmr_lambda) * redundancy
+            if mmr_score > best_score:
+                best_score, best_i = mmr_score, i
+        if best_i is None:
+            break
+        selected.append(best_i)
+        remaining.remove(best_i)
+
+    return [candidates[i] for i in selected]
 
 
 def _rrf_fuse(
@@ -565,10 +655,36 @@ async def _llm_merge(
     }
 
 
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count using the ~4 chars/token GPT-family heuristic."""
+    return max(1, len(text) // 4)
+
+
+def _apply_budget(memories: list[dict], max_tokens: int) -> list[dict]:
+    """Greedily trim the ranked result list to fit within a token budget.
+
+    Always returns at least one memory even if it exceeds the budget.
+    """
+    kept: list[dict] = []
+    used = 0
+    for m in memories:
+        cost = _estimate_tokens(m.get("text", ""))
+        if kept and used + cost > max_tokens:
+            break
+        kept.append(m)
+        used += cost
+    return kept
+
+
 async def _hybrid_search(
-    user_id: str, query: str, limit: int, recency_weight: float = 0.3
+    user_id: str,
+    query: str,
+    limit: int,
+    recency_weight: float = 0.3,
+    mmr_lambda: float = 0.5,
+    score_threshold: float = 0.0,
 ) -> list[dict]:
-    """BM25 + dense RRF(k=60) hybrid retrieval with 4-component scoring.
+    """BM25 + dense RRF(k=60) hybrid retrieval with MMR diversification.
 
     Components (Park et al. 2023 + MemoryBank):
       w_rrf      · RRF(BM25, cosine)
@@ -580,6 +696,7 @@ async def _hybrid_search(
       recency_weight=0 → (w_rrf=0.70, w_recency=0.00, w_import=0.20, w_strength=0.10)
       recency_weight=1 → (w_rrf=0.40, w_recency=0.40, w_import=0.10, w_strength=0.10)
 
+    After scoring, applies score_threshold filtering then MMR reranking for diversity.
     Updates access_count and last_accessed for returned memories.
     """
     async with aiosqlite.connect(get_db_path()) as db:
@@ -634,7 +751,13 @@ async def _hybrid_search(
         scored.append((score, m))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    results = [m for _, m in scored[:limit]]
+
+    # Pre-MMR pool: top limit*3 candidates, filtered by score_threshold
+    pre_mmr = [m for s, m in scored[: limit * 3] if s >= score_threshold]
+
+    # MMR diversification — embed_query is fast (model already warm from _dense_ranks)
+    from recall.embeddings import embed_query as _eq
+    results = _mmr_rerank(pre_mmr, _eq(query), mmr_lambda, limit)
 
     # Update access tracking for returned memories
     if results:

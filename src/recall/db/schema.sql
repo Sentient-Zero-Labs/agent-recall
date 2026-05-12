@@ -124,3 +124,22 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_api_tokens_hash
     ON api_tokens(token_hash);
+
+-- ------------------------------------------------------------------ --
+-- A2A task store (v3: persistent — was in-memory dict in v0.1)        --
+-- ------------------------------------------------------------------ --
+
+CREATE TABLE IF NOT EXISTS a2a_tasks (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'submitted',  -- submitted|working|input-required|completed|failed
+    input       TEXT NOT NULL,                      -- JSON: {text, topic}
+    output      TEXT,                               -- JSON blob, NULL until completed
+    message     TEXT,                               -- JSON blob: contradiction payload
+    pending     TEXT,                               -- JSON blob: _pending_memories list
+    resolution  TEXT,                               -- keep_existing|keep_new|keep_both
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_a2a_user ON a2a_tasks(user_id);
