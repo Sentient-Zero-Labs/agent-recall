@@ -1,8 +1,14 @@
 # Recall
 
+[![PyPI](https://img.shields.io/pypi/v/szl-recall)](https://pypi.org/project/szl-recall/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/szl-recall)](https://pypi.org/project/szl-recall/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Persistent memory layer for AI agents. Local-first. Inspectable. Framework-agnostic.
 
-Built as the implementation anchor for the [Building Effective Tools for AI](https://read.sentientzerolabs.com) series by Sentient Zero Labs.
+**PyPI:** [`szl-recall`](https://pypi.org/project/szl-recall/) &nbsp;·&nbsp; **GitHub:** [`Sentient-Zero-Labs/agent-recall`](https://github.com/Sentient-Zero-Labs/agent-recall)
+
+Built as the implementation anchor for the [Building Effective Tools for AI](https://read.sentientzerolabs.com/tools/) series by Sentient Zero Labs.
 
 ---
 
@@ -331,7 +337,7 @@ Five tables in `recall.db`:
 ## Development
 
 ```bash
-git clone https://github.com/ppritish51/recall
+git clone https://github.com/Sentient-Zero-Labs/agent-recall
 cd recall
 
 python -m venv .venv && source .venv/bin/activate
