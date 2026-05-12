@@ -54,13 +54,13 @@ Weights sum to 1.0 and shift linearly with recency_weight param:
 ## Install
 
 ```bash
-pip install recall-memory
+pip install szl-recall
 ```
 
 With optional dense vector search (requires ~500MB for the model on first run):
 
 ```bash
-pip install "recall-memory[embeddings]"
+pip install "szl-recall[embeddings]"
 ```
 
 ---

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-recall"
+name = "szl-recall"
 version = "0.2.0"
 description = "Persistent memory layer for AI agents. Local-first. Inspectable. Framework-agnostic."
 readme = "README.md"
