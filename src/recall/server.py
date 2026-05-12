@@ -1,11 +1,13 @@
-"""Recall MCP server — all 5 tools, auth middleware, 30s timeout."""
+"""Recall MCP server — all 6 tools, auth middleware, 30s timeout."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
+import os
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -13,12 +15,14 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 import aiosqlite
+import anthropic
 from fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from recall.db.connection import get_db_path, init_db
+from recall.decay import DecayWorker
 from recall.logging import LoggingMiddleware
 from recall.security import hash_token, validate_tool_descriptions
 from recall.worker import ExtractionWorker
@@ -27,6 +31,18 @@ logger = logging.getLogger(__name__)
 
 user_id_ctx: ContextVar[str] = ContextVar("user_id", default="")
 extraction_worker: ExtractionWorker | None = None
+decay_worker: DecayWorker | None = None
+
+_VALID_MEMORY_TYPES = frozenset({"preference", "fact", "decision", "procedure"})
+
+_MERGE_PROMPT = """\
+Given these related memories about the same topic, produce ONE canonical memory that \
+captures all distinct information. Be specific. Preserve concrete details. Do not generalize.
+
+Memories:
+{memories}
+
+Return ONLY a JSON object: {{"text": "...", "type": "preference|fact|decision|procedure", "importance": 0.0-1.0}}"""
 
 
 # ── Middleware ────────────────────────────────────────────────────────────────
@@ -64,15 +80,19 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
-    global extraction_worker
+    global extraction_worker, decay_worker
     await init_db()
     _validate_server_descriptions()
     extraction_worker = ExtractionWorker()
     await extraction_worker.start()
+    decay_worker = DecayWorker()
+    await decay_worker.start()
     await _recover_orphaned_operations()
     yield
     if extraction_worker:
         await extraction_worker.stop()
+    if decay_worker:
+        await decay_worker.stop()
 
 
 async def _recover_orphaned_operations() -> None:
@@ -94,7 +114,7 @@ def _validate_server_descriptions() -> None:
     """Validate all tool descriptions against poisoning patterns. Fail fast."""
     tool_functions = [
         store_memory, search_memories, inspect_memories,
-        delete_memory, get_memory_stats,
+        delete_memory, get_memory_stats, consolidate_memories,
     ]
     descriptions = {
         f.__name__: (f.__doc__ or "").split("\n")[0].strip()
@@ -257,6 +277,141 @@ async def get_memory_stats() -> dict:
     }
 
 
+@mcp.tool()
+async def consolidate_memories(
+    topic: str,
+    similarity_threshold: float = 0.85,
+    dry_run: bool = False,
+) -> dict:
+    """Find semantically similar memories in a topic and merge them into canonical facts.
+    Requires embeddings extra: pip install 'szl-recall[embeddings]'. Returns a diff."""
+    user_id = user_id_ctx.get()
+
+    # Check embeddings available before any DB work
+    from recall.embeddings import embed
+    probe = embed(["test"])
+    if probe is None:
+        return {
+            "status": "error",
+            "error": "consolidate_memories requires embeddings: pip install 'szl-recall[embeddings]'",
+            "code": "EMBEDDINGS_REQUIRED",
+        }
+
+    # Fetch all active memories for this topic
+    async with aiosqlite.connect(get_db_path()) as db:
+        rows = await db.execute_fetchall(
+            "SELECT id, text, type, importance "
+            "FROM memories WHERE user_id = ? AND topic = ? AND valid_until IS NULL "
+            "ORDER BY created_at DESC",
+            (user_id, topic),
+        )
+
+    if not rows:
+        return {
+            "status": "ok",
+            "data": {
+                "groups_found": 0, "memories_consolidated": 0,
+                "memories_created": 0, "deleted_ids": [], "created": [], "dry_run": dry_run,
+            },
+            "error": None,
+        }
+
+    memories = [{"id": r[0], "text": r[1], "type": r[2], "importance": r[3]} for r in rows]
+
+    # Compute embeddings for all fetched memories
+    texts = [m["text"] for m in memories]
+    vecs = embed(texts)
+    if vecs is None:
+        return {
+            "status": "error",
+            "error": "consolidate_memories requires embeddings: pip install 'szl-recall[embeddings]'",
+            "code": "EMBEDDINGS_REQUIRED",
+        }
+    for i, m in enumerate(memories):
+        m["_vec"] = vecs[i]
+
+    # Group by cosine similarity — only merge groups with 2+ members
+    groups = _greedy_cluster(memories, similarity_threshold)
+    merge_groups = [g for g in groups if len(g) >= 2]
+
+    if not merge_groups:
+        return {
+            "status": "ok",
+            "data": {
+                "groups_found": 0, "memories_consolidated": 0,
+                "memories_created": 0, "deleted_ids": [], "created": [], "dry_run": dry_run,
+            },
+            "error": None,
+        }
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return {
+            "status": "error",
+            "error": "ANTHROPIC_API_KEY not set.",
+            "code": "NO_API_KEY",
+        }
+
+    llm_client = anthropic.AsyncAnthropic(api_key=api_key)
+    deleted_ids: list[str] = []
+    created_memories: list[dict] = []
+
+    try:
+        for group in merge_groups:
+            merged = await _llm_merge(llm_client, group, topic)
+            if merged:
+                deleted_ids.extend(m["id"] for m in group)
+                created_memories.append(merged)
+    finally:
+        await llm_client.close()
+
+    if dry_run:
+        return {
+            "status": "ok",
+            "data": {
+                "groups_found": len(merge_groups),
+                "memories_consolidated": len(deleted_ids),
+                "memories_created": len(created_memories),
+                "deleted_ids": deleted_ids,
+                "created": [{"text": m["text"], "type": m["type"], "importance": m["importance"]} for m in created_memories],
+                "dry_run": True,
+            },
+            "error": None,
+        }
+
+    # Persist: insert canonical memories, supersede originals
+    now = datetime.now(timezone.utc).isoformat()
+    persisted: list[dict] = []
+    async with aiosqlite.connect(get_db_path()) as db:
+        for merged in created_memories:
+            new_id = str(uuid.uuid4())
+            await db.execute(
+                "INSERT INTO memories (id, user_id, text, type, topic, importance, created_at, valid_from) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (new_id, user_id, merged["text"], merged["type"], topic, merged["importance"], now, now),
+            )
+            persisted.append({"id": new_id, "text": merged["text"], "type": merged["type"], "topic": topic})
+        for del_id in deleted_ids:
+            await db.execute(
+                "UPDATE memories SET valid_until = ? WHERE id = ? AND user_id = ?",
+                (now, del_id, user_id),
+            )
+        await db.commit()
+
+    return {
+        "status": "ok",
+        "data": {
+            "groups_found": len(merge_groups),
+            "memories_consolidated": len(deleted_ids),
+            "memories_created": len(persisted),
+            "deleted_ids": deleted_ids,
+            "created": persisted,
+            "dry_run": False,
+        },
+        "error": None,
+    }
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 async def _validate_token(token: str) -> str | None:
@@ -341,20 +496,95 @@ def _rrf_fuse(
     return scores
 
 
+def _greedy_cluster(memories: list[dict], threshold: float) -> list[list[dict]]:
+    """Group memories by cosine similarity using greedy assignment.
+
+    Each unassigned memory starts a new cluster. Subsequent memories join the
+    cluster of the first memory they exceed `threshold` similarity with.
+    Vectors must be pre-computed and stored as m['_vec'].
+    """
+    import numpy as np
+
+    if len(memories) <= 1:
+        return [[m] for m in memories]
+
+    vecs = np.stack([m["_vec"] for m in memories])
+    sim_matrix = vecs @ vecs.T  # cosine similarity (vectors already L2-normalized)
+
+    assigned = [False] * len(memories)
+    groups: list[list[dict]] = []
+
+    for i in range(len(memories)):
+        if assigned[i]:
+            continue
+        group = [memories[i]]
+        assigned[i] = True
+        for j in range(i + 1, len(memories)):
+            if not assigned[j] and float(sim_matrix[i, j]) >= threshold:
+                group.append(memories[j])
+                assigned[j] = True
+        groups.append(group)
+
+    return groups
+
+
+async def _llm_merge(
+    client: anthropic.AsyncAnthropic, group: list[dict], topic: str
+) -> dict | None:
+    """Call Claude Haiku to merge a group of similar memories into one canonical memory."""
+    memories_str = "\n".join(f"{i + 1}. {m['text']}" for i, m in enumerate(group))
+    prompt = _MERGE_PROMPT.format(memories=memories_str)
+
+    response = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=512,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+    try:
+        merged = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("consolidation_merge_parse_failed", extra={"topic": topic, "raw": raw[:100]})
+        return None
+
+    mem_type = merged.get("type", "fact")
+    if mem_type not in _VALID_MEMORY_TYPES:
+        mem_type = "fact"
+    text = str(merged.get("text", "")).strip()
+    if not text:
+        return None
+
+    return {
+        "text": text,
+        "type": mem_type,
+        "importance": max(0.0, min(1.0, float(merged.get("importance", 0.5)))),
+    }
+
+
 async def _hybrid_search(
     user_id: str, query: str, limit: int, recency_weight: float = 0.3
 ) -> list[dict]:
     """BM25 + dense RRF(k=60) hybrid retrieval with 4-component scoring.
 
     Components (Park et al. 2023 + MemoryBank):
-      0.50 · RRF(BM25, cosine)
-      0.25 · exp(-Δt / (1 + access_count))   — recency with strength modifier
-      0.15 · importance
-      0.10 · log(1+ac) / log(1+max_ac)       — access frequency (strength)
+      w_rrf      · RRF(BM25, cosine)
+      w_recency  · exp(-Δt / (1 + access_count))   — recency with strength modifier
+      w_import   · importance * decay_score          — decay-adjusted importance
+      w_strength · log(1+ac) / log(1+max_ac)        — access frequency (strength)
+
+    Weights interpolate linearly with recency_weight (always sum to 1.0):
+      recency_weight=0 → (w_rrf=0.70, w_recency=0.00, w_import=0.20, w_strength=0.10)
+      recency_weight=1 → (w_rrf=0.40, w_recency=0.40, w_import=0.10, w_strength=0.10)
+
+    Updates access_count and last_accessed for returned memories.
     """
     async with aiosqlite.connect(get_db_path()) as db:
         rows = await db.execute_fetchall(
-            "SELECT id, text, topic, importance, type, created_at, access_count "
+            "SELECT id, text, topic, importance, type, created_at, access_count, decay_score "
             "FROM memories WHERE user_id = ? AND valid_until IS NULL "
             "ORDER BY created_at DESC LIMIT ?",
             (user_id, limit * 5),
@@ -367,6 +597,7 @@ async def _hybrid_search(
         {
             "id": r[0], "text": r[1], "topic": r[2], "importance": r[3],
             "type": r[4], "created_at": r[5], "access_count": r[6] or 0,
+            "decay_score": r[7],
         }
         for r in rows
     ]
@@ -379,12 +610,10 @@ async def _hybrid_search(
     now = datetime.now(timezone.utc)
     max_ac = max((m["access_count"] for m in memories), default=1) or 1
 
-    # Weights interpolate linearly with recency_weight and always sum to 1.0.
-    # recency_weight=0 → relevance-dominant; recency_weight=1 → recency-dominant.
-    w_rrf      = 0.70 - 0.30 * recency_weight   # 0.70 → 0.40
-    w_recency  = 0.40 * recency_weight           # 0.00 → 0.40
-    w_import   = 0.20 - 0.10 * recency_weight    # 0.20 → 0.10
-    w_strength = 0.10                            # fixed
+    w_rrf      = 0.70 - 0.30 * recency_weight
+    w_recency  = 0.40 * recency_weight
+    w_import   = 0.20 - 0.10 * recency_weight
+    w_strength = 0.10
 
     scored: list[tuple[float, dict]] = []
     for i, m in enumerate(memories):
@@ -394,16 +623,35 @@ async def _hybrid_search(
         ac = m["access_count"]
         recency = math.exp(-age_days / (1 + ac))
         strength = math.log(1 + ac) / math.log(1 + max_ac)
+        decay = m["decay_score"]
+        effective_importance = (m.get("importance") or 0.5) * (decay if decay is not None else 1.0)
         score = (
             w_rrf      * rrf[i]
             + w_recency  * recency
-            + w_import   * (m.get("importance") or 0.5)
+            + w_import   * effective_importance
             + w_strength * strength
         )
         scored.append((score, m))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [m for _, m in scored[:limit]]
+    results = [m for _, m in scored[:limit]]
+
+    # Update access tracking for returned memories
+    if results:
+        returned_ids = [m["id"] for m in results]
+        try:
+            async with aiosqlite.connect(get_db_path()) as db:
+                for mid in returned_ids:
+                    await db.execute(
+                        "UPDATE memories SET access_count = access_count + 1, "
+                        "last_accessed = datetime('now') WHERE id = ?",
+                        (mid,),
+                    )
+                await db.commit()
+        except Exception as exc:
+            logger.warning("access_count_update_failed", extra={"error": str(exc)})
+
+    return results
 
 
 # ── ASGI app factory ──────────────────────────────────────────────────────────

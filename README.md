@@ -109,11 +109,11 @@ recall create-token my-agent --db recall.db
 }
 ```
 
-Restart Claude Desktop. Recall's five tools are now available in every conversation.
+Restart Claude Desktop. Recall's six tools are now available in every conversation.
 
 ---
 
-## Five MCP tools
+## Six MCP tools
 
 ### `store_memory`
 
@@ -193,6 +193,33 @@ Returns:
     }
   }
 ```
+
+### `consolidate_memories`
+
+Finds and merges semantically similar memories in a given topic using embedding-based clustering followed by an LLM merge pass. Reduces memory bloat and improves retrieval quality over time.
+
+```
+Arguments:
+  topic                str    — topic to consolidate (e.g. "engineering")
+  similarity_threshold float  — cosine similarity cutoff for clustering (default 0.85)
+  dry_run              bool   — if true, returns a plan without modifying the database
+
+Returns:
+  {
+    status: "ok",
+    data: {
+      groups_found: N,
+      memories_consolidated: N,
+      memories_created: N,
+      deleted_ids: [...],
+      created: [...],
+      dry_run: bool
+    }
+  }
+  {status: "error", code: "EMBEDDINGS_REQUIRED"}  — sentence-transformers not installed
+```
+
+**What happens**: active memories in the topic are embedded, clustered by cosine similarity, and each cluster is sent to Claude Haiku for a merge pass. Original memories are superseded (`valid_until` set); a single canonical memory is written in their place.
 
 ---
 
@@ -377,12 +404,12 @@ recall status [--db recall.db]
 
 ## Version history
 
-- **v0.2** (current): Hybrid BM25Plus+RRF search, 4-component scoring, structured fact extraction (entity/attribute/value), deterministic contradiction detection, A2A consolidation worker, 48-test suite.
+- **v0.3** (current): Memory decay scoring (`DecayWorker`, exponential decay with access-count protection), `consolidate_memories` MCP tool (6th tool, embedding-based clustering + LLM merge), access_count increment fix in hybrid search, 59-test suite.
+- **v0.2**: Hybrid BM25Plus+RRF search, 4-component scoring, structured fact extraction (entity/attribute/value), deterministic contradiction detection, A2A consolidation worker, 48-test suite.
 - **v0.1**: SQLite + BM25 search, 5 MCP tools, async extraction via Claude Haiku, bearer auth.
 
 **Roadmap:**
 - Postgres backend + pgvector for production deployments
-- Memory decay scoring (time-weighted importance reduction)
 - Multi-user admin API
 - Webhook notifications on extraction completion
 
