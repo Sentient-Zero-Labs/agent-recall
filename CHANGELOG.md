@@ -7,6 +7,34 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.9] — 2026-05
+
+### Fixed
+- **Postgres connection exhaustion**: `get_backend()` previously created a new `asyncpg.create_pool()` on every call, leaving dozens of idle connections open and hitting Postgres's `max_connections` limit. Fixed by making the asyncpg pool a module-level singleton (`_pg_pool`), shared across all `get_backend()` calls within the same process. Pool is cleanly closed on server shutdown via `close_pg_pool()` called from the lifespan teardown.
+
+---
+
+## [0.3.8] — 2026-05
+
+### Fixed
+- **Postgres schema init**: `BLOB` type (SQLite-only) translated to `BYTEA` in `_translate_sql()` so the `embedding` column in the `memories` table initialises correctly on Postgres.
+
+---
+
+## [0.3.7] — 2026-05
+
+### Fixed
+- **Postgres schema init**: `_init_postgres()` now strips inline `--` comments from each SQL line before splitting by `;`. Previously a semicolon inside a comment (`-- ... active; set on contradiction`) caused `schema.sql` to be split mid-statement, producing `syntax error at end of input` on every fresh Postgres deployment.
+
+---
+
+## [0.3.6] — 2026-05
+
+### Fixed
+- `_init_postgres()`: skip-entire-statement logic changed from `stmt.startswith("--")` to filtering comment-only lines within each chunk, so CREATE TABLE statements prefixed with block comments are no longer silently dropped. (Partial fix — inline comment semicolons still broken; fully fixed in 0.3.7.)
+
+---
+
 ## [0.3.5] — 2026-05
 
 ### Changed

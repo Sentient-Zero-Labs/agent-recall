@@ -20,7 +20,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from recall.db.backend import get_backend
+from recall.db.backend import close_pg_pool, get_backend
 from recall.db.connection import init_db
 from recall.decay import DecayWorker
 from recall.logging import LoggingMiddleware
@@ -93,6 +93,7 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
         await extraction_worker.stop()
     if decay_worker:
         await decay_worker.stop()
+    await close_pg_pool()
 
 
 async def _recover_orphaned_operations() -> None:

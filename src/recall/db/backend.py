@@ -93,6 +93,7 @@ class SQLiteBackend(DatabaseBackend):
 _PLACEHOLDER_RE      = re.compile(r"\?")
 _INSERT_OR_IGNORE_RE = re.compile(r"\bINSERT\s+OR\s+IGNORE\b", re.IGNORECASE)
 _DATETIME_NOW_RE     = re.compile(r"datetime\('now'\)", re.IGNORECASE)
+_BLOB_TYPE_RE        = re.compile(r"\bBLOB\b", re.IGNORECASE)
 
 
 def _translate_placeholders(sql: str) -> str:
@@ -110,35 +111,57 @@ def _translate_placeholders(sql: str) -> str:
 def _translate_sql(sql: str) -> str:
     """Translate SQLite-flavoured SQL to Postgres.
 
-    Handles three differences:
+    Handles four differences:
       1. INSERT OR IGNORE  →  INSERT ... ON CONFLICT DO NOTHING
       2. datetime('now')   →  NOW()
-      3. ?                 →  $1, $2, ...
+      3. BLOB              →  BYTEA  (type alias only in DDL)
+      4. ?                 →  $1, $2, ...
     """
     had_ignore = bool(_INSERT_OR_IGNORE_RE.search(sql))
     sql = _INSERT_OR_IGNORE_RE.sub("INSERT", sql)
     sql = _DATETIME_NOW_RE.sub("NOW()", sql)
+    sql = _BLOB_TYPE_RE.sub("BYTEA", sql)
     sql = _translate_placeholders(sql)
     if had_ignore:
         sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
     return sql
 
 
+
+# ── Postgres pool singleton ───────────────────────────────────────────────────
+# One pool shared across ALL get_backend() calls within the same process.
+# Without this, each call creates a new pool (min 1 conn each), quickly
+# exhausting Postgres's max_connections.
+
+_pg_pool: Any = None
+
+
+async def _get_pg_pool(url: str) -> Any:
+    global _pg_pool
+    if _pg_pool is None:
+        import asyncpg
+        _pg_pool = await asyncpg.create_pool(url, min_size=1, max_size=5)
+    return _pg_pool
+
+
+async def close_pg_pool() -> None:
+    """Close the shared Postgres pool. Call on server shutdown."""
+    global _pg_pool
+    if _pg_pool is not None:
+        await _pg_pool.close()
+        _pg_pool = None
+
+
 class PostgresBackend(DatabaseBackend):
-    """asyncpg wrapper with connection pooling and automatic ? → $N translation."""
+    """asyncpg wrapper using a shared pool and automatic ? → $N translation."""
 
     def __init__(self, url: str) -> None:
         self._url = url
-        self._pool: Any = None  # asyncpg.Pool
+        self._pool: Any = None
         self._conn: Any = None  # asyncpg.Connection acquired from pool
 
-    async def _ensure_pool(self) -> None:
-        if self._pool is None:
-            import asyncpg
-            self._pool = await asyncpg.create_pool(self._url, min_size=1, max_size=10)
-
     async def __aenter__(self) -> "PostgresBackend":
-        await self._ensure_pool()
+        self._pool = await _get_pg_pool(self._url)
         self._conn = await self._pool.acquire()
         return self
 
@@ -176,7 +199,7 @@ class PostgresBackend(DatabaseBackend):
 def get_backend() -> DatabaseBackend:
     """Return the appropriate backend based on RECALL_DB_URL environment variable.
 
-    RECALL_DB_URL set  → PostgresBackend
+    RECALL_DB_URL set  → PostgresBackend (shared pool singleton)
     RECALL_DB_URL unset → SQLiteBackend (uses RECALL_DB_PATH / recall.db)
     """
     url = os.environ.get("RECALL_DB_URL")

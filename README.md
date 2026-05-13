@@ -6,7 +6,7 @@
 
 Persistent memory layer for AI agents. Local-first. Inspectable. Framework-agnostic.
 
-**PyPI:** [`szl-recall`](https://pypi.org/project/szl-recall/) &nbsp;·&nbsp; **GitHub:** [`Sentient-Zero-Labs/agent-recall`](https://github.com/Sentient-Zero-Labs/agent-recall)
+**PyPI:** [`szl-recall`](https://pypi.org/project/szl-recall/) &nbsp;·&nbsp; **GitHub:** [`Sentient-Zero-Labs/szl-recall`](https://github.com/Sentient-Zero-Labs/szl-recall) &nbsp;·&nbsp; **Docs:** [Wiki](https://github.com/Sentient-Zero-Labs/szl-recall/wiki)
 
 Built as the implementation anchor for the [Building Effective Tools for AI](https://read.sentientzerolabs.com/tools/) series by Sentient Zero Labs.
 
@@ -18,7 +18,7 @@ Recall is an MCP server that gives AI agents durable, structured memory across s
 
 An agent sends raw conversation text to Recall via `store_memory`. Recall extracts typed facts in the background using Claude Haiku — things like *"user prefers Python for backend services"* or *"team decided to use FastAPI for the new service"* — and stores them as searchable memories. When the agent needs context, it calls `search_memories` and gets back the most relevant memories ranked by a 4-component scoring model (relevance, recency, importance, access frequency).
 
-Everything is local: one SQLite file, one process, no external services beyond the Anthropic API for extraction.
+Local-first: SQLite by default (one file, no setup), Postgres optional via `RECALL_DB_URL`. No external services beyond the Anthropic API for extraction.
 
 ---
 
@@ -388,7 +388,7 @@ Six tables in `recall.db`:
 ## Development
 
 ```bash
-git clone https://github.com/Sentient-Zero-Labs/agent-recall
+git clone https://github.com/Sentient-Zero-Labs/szl-recall
 cd recall
 
 python -m venv .venv && source .venv/bin/activate
@@ -442,7 +442,11 @@ Note: `--db` flag on `recall serve` now correctly overrides `RECALL_DB_PATH` env
 
 ## Version history
 
-- **v0.3.4** (current): `delete_namespace_data` renamed from `delete_user_data` (consistent naming). `store_memory` `idempotency_key` is now optional — auto-generates a UUID when omitted.
+- **v0.3.9** (current): Postgres connection exhaustion fix — `PostgresBackend` now uses a shared pool singleton across all DB calls, preventing `TooManyConnectionsError` on busy deployments. Pool closes cleanly on server shutdown.
+- **v0.3.8**: `BLOB` type translated to `BYTEA` in Postgres schema init — the `embedding` column now creates correctly on Postgres.
+- **v0.3.7**: Postgres schema init fixed — inline SQL comments containing `;` no longer cause `CREATE TABLE` statements to be split mid-statement during `_init_postgres()`.
+- **v0.3.5–v0.3.6**: Postgres backend fully wired — `RECALL_DB_URL` now routes all server, worker, decay, A2A, and CLI queries to Postgres via `PostgresBackend`. `recall status` and `recall create-token` support Postgres deployments.
+- **v0.3.4**: `delete_namespace_data` renamed from `delete_user_data` (consistent naming). `store_memory` `idempotency_key` is now optional — auto-generates a UUID when omitted.
 - **v0.3.3**: `user_id` renamed to `namespace` across all DB columns, code, and CLI. DB migration runs automatically on startup. MMR bug fix: relevance signal now uses hybrid scores (not raw cosine) so `mmr_lambda=1.0` correctly preserves full ranking order.
 - **v0.3.0–v0.3.2**: MMR diversification (`mmr_lambda`), context budget trimming (`max_tokens`), GDPR erasure (`delete_namespace_data`, 7th tool), A2A task persistence (survives restarts), Postgres backend abstraction (`RECALL_DB_URL`), `--db` CLI bug fix, TROUBLESHOOTING.md, sentence-transformers 5.5.0 validated.
 - **v0.2**: Hybrid BM25Plus+RRF search, 4-component scoring, structured fact extraction (entity/attribute/value), deterministic contradiction detection, A2A consolidation worker.

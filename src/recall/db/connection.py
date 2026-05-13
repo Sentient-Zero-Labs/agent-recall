@@ -115,12 +115,18 @@ async def _init_postgres() -> None:
     """
     from recall.db.backend import get_backend
     schema_sql = _SCHEMA_PATH.read_text()
+    # Strip inline -- comments from each line before splitting by ; to avoid false
+    # splits on semicolons that appear inside SQL comments (e.g. "-- valid; see docs")
+    stripped_lines = []
+    for line in schema_sql.splitlines():
+        idx = line.find("--")
+        if idx >= 0:
+            line = line[:idx]
+        stripped_lines.append(line)
+    schema_clean = "\n".join(stripped_lines)
     async with get_backend() as db:
-        for stmt in schema_sql.split(";"):
-            # Strip comment-only lines; many statements in schema.sql are prefixed
-            # with block comments, so checking stmt.startswith("--") would skip them.
-            lines = [ln for ln in stmt.splitlines() if not ln.strip().startswith("--")]
-            clean = "\n".join(lines).strip()
+        for stmt in schema_clean.split(";"):
+            clean = stmt.strip()
             if not clean:
                 continue
             await db.execute(clean)
