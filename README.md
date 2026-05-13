@@ -123,7 +123,7 @@ Stores conversation text for background extraction. Returns immediately (<10ms).
 Arguments:
   text            str   — conversation transcript or fact to store
   topic           str   — context label (e.g. "engineering", "personal", "project-x")
-  idempotency_key str   — unique key for this submission; duplicates are ignored
+  idempotency_key str   — (optional) unique key; duplicates are silently ignored. Auto-generated UUID if omitted.
   session_id      str   — (optional) conversation ID for provenance
   agent_id        str   — (optional) which agent submitted this
 
@@ -442,8 +442,9 @@ Note: `--db` flag on `recall serve` now correctly overrides `RECALL_DB_PATH` env
 
 ## Version history
 
-- **v0.3.3** (current): `user_id` renamed to `namespace` — tokens, DB columns, and all queries. Namespace can be a user, agent (`agent:code-reviewer-v2`), project, or any string. DB migration runs automatically on startup. MMR bug fix: relevance signal now uses hybrid scores (recency + decay + BM25 + density) instead of raw cosine, so `mmr_lambda=1.0` correctly preserves full ranking order.
-- **v0.3.0–v0.3.2**: MMR diversification (`mmr_lambda` param), context budget trimming (`max_tokens`), GDPR erasure (`delete_namespace_data`, 7th tool), A2A task persistence (survives restarts), Postgres backend (`RECALL_DB_URL`), `--db` CLI bug fix, TROUBLESHOOTING.md, sentence-transformers 5.5.0 validated.
+- **v0.3.4** (current): `delete_namespace_data` renamed from `delete_user_data` (consistent naming). `store_memory` `idempotency_key` is now optional — auto-generates a UUID when omitted.
+- **v0.3.3**: `user_id` renamed to `namespace` across all DB columns, code, and CLI. DB migration runs automatically on startup. MMR bug fix: relevance signal now uses hybrid scores (not raw cosine) so `mmr_lambda=1.0` correctly preserves full ranking order.
+- **v0.3.0–v0.3.2**: MMR diversification (`mmr_lambda`), context budget trimming (`max_tokens`), GDPR erasure (`delete_namespace_data`, 7th tool), A2A task persistence (survives restarts), Postgres backend abstraction (`RECALL_DB_URL`), `--db` CLI bug fix, TROUBLESHOOTING.md, sentence-transformers 5.5.0 validated.
 - **v0.2**: Hybrid BM25Plus+RRF search, 4-component scoring, structured fact extraction (entity/attribute/value), deterministic contradiction detection, A2A consolidation worker.
 - **v0.1**: SQLite + BM25 search, 5 MCP tools, async extraction via Claude Haiku, bearer auth.
 
