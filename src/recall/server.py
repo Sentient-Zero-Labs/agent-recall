@@ -14,14 +14,14 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
-import aiosqlite
 import anthropic
 from fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from recall.db.connection import get_db_path, init_db
+from recall.db.backend import get_backend
+from recall.db.connection import init_db
 from recall.decay import DecayWorker
 from recall.logging import LoggingMiddleware
 from recall.security import hash_token, validate_tool_descriptions
@@ -97,16 +97,16 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
 
 async def _recover_orphaned_operations() -> None:
     """Mark any queued/processing operations left over from a prior crash as failed."""
-    async with aiosqlite.connect(get_db_path()) as db:
-        cursor = await db.execute(
+    async with get_backend() as db:
+        rowcount = await db.execute(
             "UPDATE operations SET status = 'failed', updated_at = datetime('now') "
             "WHERE status IN ('queued', 'processing')",
         )
         await db.commit()
-    if cursor.rowcount:
+    if rowcount:
         logger.warning(
             "startup_orphan_recovery",
-            extra={"count": cursor.rowcount},
+            extra={"count": rowcount},
         )
 
 
@@ -145,14 +145,14 @@ async def store_memory(
         idempotency_key = str(uuid.uuid4())
 
     job_id = str(uuid.uuid4())
-    async with aiosqlite.connect(get_db_path()) as db:
-        cursor = await db.execute(
+    async with get_backend() as db:
+        rowcount = await db.execute(
             "INSERT OR IGNORE INTO operations (id, idempotency_key, namespace, status) "
             "VALUES (?,?,?,'queued')",
             (job_id, idempotency_key, namespace),
         )
         await db.commit()
-        if cursor.rowcount == 0:
+        if rowcount == 0:
             return {"status": "ok", "data": {"queued": False, "cached": True}, "error": None}
 
     if extraction_worker:
@@ -203,14 +203,14 @@ async def inspect_memories(limit: int = 20, offset: int = 0) -> dict:
     limit = min(limit, 50)
     namespace = namespace_ctx.get()
 
-    async with aiosqlite.connect(get_db_path()) as db:
-        rows = await db.execute_fetchall(
+    async with get_backend() as db:
+        rows = await db.fetch_all(
             "SELECT id, text, topic, importance, type, created_at "
             "FROM memories WHERE namespace = ? AND valid_until IS NULL "
             "ORDER BY created_at DESC LIMIT ? OFFSET ?",
             (namespace, limit, offset),
         )
-        count = await db.execute_fetchall(
+        count = await db.fetch_all(
             "SELECT COUNT(*) FROM memories WHERE namespace = ? AND valid_until IS NULL",
             (namespace,),
         )
@@ -244,13 +244,13 @@ async def delete_memory(memory_id: str) -> dict:
     """Permanently delete a memory by ID. This action cannot be undone."""
     namespace = namespace_ctx.get()
 
-    async with aiosqlite.connect(get_db_path()) as db:
-        cursor = await db.execute(
+    async with get_backend() as db:
+        rowcount = await db.execute(
             "DELETE FROM memories WHERE id = ? AND namespace = ?",
             (memory_id, namespace),
         )
         await db.commit()
-        if cursor.rowcount == 0:
+        if rowcount == 0:
             return {
                 "status": "error",
                 "error": (
@@ -268,13 +268,13 @@ async def get_memory_stats() -> dict:
     """Return memory counts and storage stats for the current user. Fast health check."""
     namespace = namespace_ctx.get()
 
-    async with aiosqlite.connect(get_db_path()) as db:
-        by_type = await db.execute_fetchall(
+    async with get_backend() as db:
+        by_type = await db.fetch_all(
             "SELECT type, COUNT(*) FROM memories "
             "WHERE namespace = ? AND valid_until IS NULL GROUP BY type",
             (namespace,),
         )
-        pending = await db.execute_fetchall(
+        pending = await db.fetch_all(
             "SELECT COUNT(*) FROM operations WHERE namespace = ? AND status = 'queued'",
             (namespace,),
         )
@@ -311,8 +311,8 @@ async def consolidate_memories(
         }
 
     # Fetch all active memories for this topic
-    async with aiosqlite.connect(get_db_path()) as db:
-        rows = await db.execute_fetchall(
+    async with get_backend() as db:
+        rows = await db.fetch_all(
             "SELECT id, text, type, importance "
             "FROM memories WHERE namespace = ? AND topic = ? AND valid_until IS NULL "
             "ORDER BY created_at DESC",
@@ -395,7 +395,7 @@ async def consolidate_memories(
     # Persist: insert canonical memories, supersede originals
     now = datetime.now(timezone.utc).isoformat()
     persisted: list[dict] = []
-    async with aiosqlite.connect(get_db_path()) as db:
+    async with get_backend() as db:
         for merged in created_memories:
             new_id = str(uuid.uuid4())
             await db.execute(
@@ -440,7 +440,7 @@ async def delete_namespace_data(confirm: str) -> dict:
             "code": "CONFIRM_REQUIRED",
         }
     namespace = namespace_ctx.get()
-    async with aiosqlite.connect(get_db_path()) as db:
+    async with get_backend() as db:
         await db.execute("DELETE FROM memories WHERE namespace = ?", (namespace,))
         await db.execute("DELETE FROM a2a_tasks WHERE namespace = ?", (namespace,))
         await db.execute("DELETE FROM operations WHERE namespace = ?", (namespace,))
@@ -448,10 +448,9 @@ async def delete_namespace_data(confirm: str) -> dict:
             "DELETE FROM tool_call_records WHERE namespace = ? AND tool_name != 'delete_namespace_data'",
             (namespace,),
         )
-        r = await db.execute(
+        tokens_revoked = await db.execute(
             "UPDATE api_tokens SET revoked = 1 WHERE namespace = ?", (namespace,)
         )
-        tokens_revoked = r.rowcount
         await db.commit()
     return {
         "status": "ok",
@@ -466,9 +465,8 @@ async def _validate_token(token: str) -> str | None:
     if not token:
         return None
     token_hash = hash_token(token)
-    db_path = get_db_path()
-    async with aiosqlite.connect(db_path) as db:
-        rows = await db.execute_fetchall(
+    async with get_backend() as db:
+        rows = await db.fetch_all(
             "SELECT namespace FROM api_tokens WHERE token_hash = ? AND revoked = 0",
             (token_hash,),
         )
@@ -711,8 +709,8 @@ async def _hybrid_search(
     After scoring, applies score_threshold filtering then MMR reranking for diversity.
     Updates access_count and last_accessed for returned memories.
     """
-    async with aiosqlite.connect(get_db_path()) as db:
-        rows = await db.execute_fetchall(
+    async with get_backend() as db:
+        rows = await db.fetch_all(
             "SELECT id, text, topic, importance, type, created_at, access_count, decay_score "
             "FROM memories WHERE namespace = ? AND valid_until IS NULL "
             "ORDER BY created_at DESC LIMIT ?",
@@ -778,7 +776,7 @@ async def _hybrid_search(
     if results:
         returned_ids = [m["id"] for m in results]
         try:
-            async with aiosqlite.connect(get_db_path()) as db:
+            async with get_backend() as db:
                 for mid in returned_ids:
                     await db.execute(
                         "UPDATE memories SET access_count = access_count + 1, "

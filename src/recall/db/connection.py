@@ -1,4 +1,4 @@
-"""SQLite connection management for Recall."""
+"""Database connection management for Recall (SQLite + Postgres)."""
 
 from __future__ import annotations
 
@@ -90,8 +90,7 @@ async def _migrate_v4(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
-async def init_db() -> None:
-    """Create tables and apply schema. Idempotent — safe to call on every startup."""
+async def _init_sqlite() -> None:
     schema = _SCHEMA_PATH.read_text()
     async with aiosqlite.connect(_DB_PATH) as db:
         await db.executescript(schema)
@@ -105,6 +104,35 @@ async def init_db() -> None:
         await _migrate_v2(db)
         await _migrate_v3(db)
         await _migrate_v4(db)
+
+
+async def _init_postgres() -> None:
+    """Create tables for a Postgres backend. Schema.sql is translated at execution time.
+
+    Runs each DDL statement individually (no executescript equivalent in asyncpg).
+    Idempotent — uses CREATE TABLE/INDEX IF NOT EXISTS + ON CONFLICT DO NOTHING.
+    Skips SQLite-specific migrations; Postgres deployments start with the current schema.
+    """
+    from recall.db.backend import get_backend
+    schema_sql = _SCHEMA_PATH.read_text()
+    async with get_backend() as db:
+        for stmt in schema_sql.split(";"):
+            # Strip comment-only lines; many statements in schema.sql are prefixed
+            # with block comments, so checking stmt.startswith("--") would skip them.
+            lines = [ln for ln in stmt.splitlines() if not ln.strip().startswith("--")]
+            clean = "\n".join(lines).strip()
+            if not clean:
+                continue
+            await db.execute(clean)
+        await db.commit()
+
+
+async def init_db() -> None:
+    """Create tables and apply schema. Idempotent — safe to call on every startup."""
+    if os.environ.get("RECALL_DB_URL"):
+        await _init_postgres()
+    else:
+        await _init_sqlite()
 
 
 def get_db_path() -> Path:

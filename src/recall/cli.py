@@ -73,25 +73,25 @@ async def _cmd_create_token(args: argparse.Namespace) -> None:
     import uuid
     from pathlib import Path
 
-    os.environ.setdefault("RECALL_DB_PATH", args.db)
-
-    db_path = Path(args.db)
-    if not db_path.exists():
-        print(f"Database not found: {db_path}")
-        print("Run 'recall serve' first to initialize the database, then create a token.")
-        sys.exit(1)
-
-    from recall.db.connection import set_db_path
     from recall.security import hash_token
-    import aiosqlite
+    from recall.db.backend import get_backend
 
-    set_db_path(db_path)
+    if not os.environ.get("RECALL_DB_URL"):
+        # SQLite path — verify DB exists before connecting
+        db_path = Path(args.db)
+        if not db_path.exists():
+            print(f"Database not found: {db_path}")
+            print("Run 'recall serve' first to initialize the database, then create a token.")
+            sys.exit(1)
+        os.environ.setdefault("RECALL_DB_PATH", str(db_path))
+        from recall.db.connection import set_db_path
+        set_db_path(db_path)
 
     raw_token = secrets.token_urlsafe(32)
     token_hash = hash_token(raw_token)
     token_id = str(uuid.uuid4())
 
-    async with aiosqlite.connect(db_path) as db:
+    async with get_backend() as db:
         await db.execute(
             "INSERT INTO api_tokens (id, token_hash, namespace, revoked) VALUES (?, ?, ?, 0)",
             (token_id, token_hash, args.namespace),
@@ -105,28 +105,34 @@ async def _cmd_create_token(args: argparse.Namespace) -> None:
 
 
 async def _cmd_status(args: argparse.Namespace) -> None:
-    from recall.db.connection import set_db_path, init_db
+    import os
     from pathlib import Path
 
-    db_path = Path(args.db)
-    if not db_path.exists():
-        print(f"Database not found: {db_path}")
-        print("Run 'recall serve' first to initialize the database.")
-        return
+    from recall.db.backend import get_backend
 
-    set_db_path(db_path)
-    import aiosqlite
-    async with aiosqlite.connect(db_path) as db:
-        rows = await db.execute_fetchall("SELECT COUNT(*) FROM memories")
+    if not os.environ.get("RECALL_DB_URL"):
+        db_path = Path(args.db)
+        if not db_path.exists():
+            print(f"Database not found: {db_path}")
+            print("Run 'recall serve' first to initialize the database.")
+            return
+        from recall.db.connection import set_db_path
+        set_db_path(db_path)
+
+    async with get_backend() as db:
+        rows = await db.fetch_all("SELECT COUNT(*) FROM memories")
         total = rows[0][0]
-        by_type = await db.execute_fetchall(
+        by_type = await db.fetch_all(
             "SELECT type, COUNT(*) FROM memories GROUP BY type"
         )
-        pending = await db.execute_fetchall(
+        pending = await db.fetch_all(
             "SELECT COUNT(*) FROM operations WHERE status = 'queued'"
         )
 
-    print(f"Database: {db_path}")
+    if os.environ.get("RECALL_DB_URL"):
+        print(f"Database: {os.environ['RECALL_DB_URL']}")
+    else:
+        print(f"Database: {args.db}")
     print(f"Total memories: {total}")
     for mem_type, count in by_type:
         print(f"  {mem_type}: {count}")

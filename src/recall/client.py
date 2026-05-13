@@ -11,9 +11,8 @@ import time
 import uuid
 from datetime import datetime
 
-import aiosqlite
-
-from recall.db.connection import get_db_path, init_db
+from recall.db.backend import get_backend
+from recall.db.connection import init_db
 from recall.models import MemoryType, MemoryUnit
 
 
@@ -58,7 +57,7 @@ class MemoryClient:
             source_session=source_session,
             created_at=datetime.utcnow(),
         )
-        async with aiosqlite.connect(get_db_path()) as db:
+        async with get_backend() as db:
             await db.execute(
                 """INSERT INTO memories
                    (id, namespace, text, type, topic, importance, confidence,
@@ -82,8 +81,8 @@ class MemoryClient:
     # ── Read ───────────────────────────────────────────────────────────────
 
     async def get(self, memory_id: str, namespace: str) -> MemoryUnit | None:
-        async with aiosqlite.connect(get_db_path()) as db:
-            rows = await db.execute_fetchall(
+        async with get_backend() as db:
+            rows = await db.fetch_all(
                 "SELECT id, namespace, text, type, topic, importance, confidence, "
                 "source_session, created_at, last_accessed, access_count "
                 "FROM memories WHERE id = ? AND namespace = ?",
@@ -97,8 +96,8 @@ class MemoryClient:
         self, namespace: str, query: str, limit: int = 20
     ) -> list[MemoryUnit]:
         """Simple keyword search. Thin wrapper — use MCP tool for production."""
-        async with aiosqlite.connect(get_db_path()) as db:
-            rows = await db.execute_fetchall(
+        async with get_backend() as db:
+            rows = await db.fetch_all(
                 "SELECT id, namespace, text, type, topic, importance, confidence, "
                 "source_session, created_at, last_accessed, access_count "
                 "FROM memories WHERE namespace = ? AND text LIKE ? LIMIT ?",
@@ -110,14 +109,14 @@ class MemoryClient:
         self, namespace: str, limit: int = 20, offset: int = 0
     ) -> tuple[list[MemoryUnit], int]:
         """Return (memories, total_count)."""
-        async with aiosqlite.connect(get_db_path()) as db:
-            rows = await db.execute_fetchall(
+        async with get_backend() as db:
+            rows = await db.fetch_all(
                 "SELECT id, namespace, text, type, topic, importance, confidence, "
                 "source_session, created_at, last_accessed, access_count "
                 "FROM memories WHERE namespace = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (namespace, limit, offset),
             )
-            count_rows = await db.execute_fetchall(
+            count_rows = await db.fetch_all(
                 "SELECT COUNT(*) FROM memories WHERE namespace = ?", (namespace,)
             )
         total = count_rows[0][0]
@@ -127,22 +126,22 @@ class MemoryClient:
 
     async def delete(self, memory_id: str, namespace: str) -> bool:
         """Returns True if deleted, False if not found."""
-        async with aiosqlite.connect(get_db_path()) as db:
-            cursor = await db.execute(
+        async with get_backend() as db:
+            rowcount = await db.execute(
                 "DELETE FROM memories WHERE id = ? AND namespace = ?",
                 (memory_id, namespace),
             )
             await db.commit()
-        return cursor.rowcount > 0
+        return rowcount > 0
 
     async def delete_all(self, namespace: str) -> int:
         """Delete all memories for a user. Returns count deleted."""
-        async with aiosqlite.connect(get_db_path()) as db:
-            cursor = await db.execute(
+        async with get_backend() as db:
+            rowcount = await db.execute(
                 "DELETE FROM memories WHERE namespace = ?", (namespace,)
             )
             await db.commit()
-        return cursor.rowcount
+        return rowcount
 
 
 def _row_to_memory_unit(row: tuple) -> MemoryUnit:

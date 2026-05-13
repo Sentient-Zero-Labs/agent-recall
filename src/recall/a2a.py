@@ -15,12 +15,11 @@ import uuid
 from contextvars import ContextVar
 from typing import Any
 
-import aiosqlite
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route, Router
 
-from recall.db.connection import get_db_path
+from recall.db.backend import get_backend
 from recall.worker import _extract_stub_fallback
 
 logger = logging.getLogger(__name__)
@@ -58,7 +57,7 @@ _NEGATION_TOKENS = frozenset(
 
 
 async def _db_insert_task(task: dict[str, Any]) -> None:
-    async with aiosqlite.connect(get_db_path()) as db:
+    async with get_backend() as db:
         await db.execute(
             "INSERT INTO a2a_tasks (id, namespace, status, input, created_at, updated_at) "
             "VALUES (?, ?, 'submitted', ?, datetime('now'), datetime('now'))",
@@ -68,7 +67,7 @@ async def _db_insert_task(task: dict[str, Any]) -> None:
 
 
 async def _db_update_task(task: dict[str, Any]) -> None:
-    async with aiosqlite.connect(get_db_path()) as db:
+    async with get_backend() as db:
         await db.execute(
             "UPDATE a2a_tasks SET status=?, output=?, message=?, pending=?, resolution=?, "
             "updated_at=datetime('now') WHERE id=?",
@@ -85,8 +84,8 @@ async def _db_update_task(task: dict[str, Any]) -> None:
 
 
 async def _db_load_task(task_id: str) -> dict[str, Any] | None:
-    async with aiosqlite.connect(get_db_path()) as db:
-        rows = await db.execute_fetchall(
+    async with get_backend() as db:
+        rows = await db.fetch_all(
             "SELECT id, namespace, status, input, output, message, pending, resolution "
             "FROM a2a_tasks WHERE id = ?",
             (task_id,),
@@ -279,7 +278,7 @@ async def _apply_resolution(task_id: str) -> None:
         pending = [m for m in pending if m["text"] not in conflict_texts]
     elif resolution == "keep_new":
         conflict_ids = [c["existing_id"] for c in contradictions]
-        async with aiosqlite.connect(get_db_path()) as db:
+        async with get_backend() as db:
             for mem_id in conflict_ids:
                 await db.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
             await db.commit()
@@ -306,8 +305,8 @@ async def _detect_contradictions(
     namespace: str, new_memories: list[dict]
 ) -> list[dict]:
     """Heuristic: shared 3+ tokens AND negation word present in either memory."""
-    async with aiosqlite.connect(get_db_path()) as db:
-        existing = await db.execute_fetchall(
+    async with get_backend() as db:
+        existing = await db.fetch_all(
             "SELECT id, text FROM memories WHERE namespace = ?",
             (namespace,),
         )
@@ -331,7 +330,7 @@ async def _detect_contradictions(
 async def _bulk_store(memories: list[dict]) -> int:
     if not memories:
         return 0
-    async with aiosqlite.connect(get_db_path()) as db:
+    async with get_backend() as db:
         for m in memories:
             await db.execute(
                 """INSERT OR IGNORE INTO memories

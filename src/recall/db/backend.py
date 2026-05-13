@@ -90,7 +90,9 @@ class SQLiteBackend(DatabaseBackend):
 
 # ── Postgres ──────────────────────────────────────────────────────────────────
 
-_PLACEHOLDER_RE = re.compile(r"\?")
+_PLACEHOLDER_RE      = re.compile(r"\?")
+_INSERT_OR_IGNORE_RE = re.compile(r"\bINSERT\s+OR\s+IGNORE\b", re.IGNORECASE)
+_DATETIME_NOW_RE     = re.compile(r"datetime\('now'\)", re.IGNORECASE)
 
 
 def _translate_placeholders(sql: str) -> str:
@@ -103,6 +105,23 @@ def _translate_placeholders(sql: str) -> str:
         return f"${counter}"
 
     return _PLACEHOLDER_RE.sub(_replace, sql)
+
+
+def _translate_sql(sql: str) -> str:
+    """Translate SQLite-flavoured SQL to Postgres.
+
+    Handles three differences:
+      1. INSERT OR IGNORE  →  INSERT ... ON CONFLICT DO NOTHING
+      2. datetime('now')   →  NOW()
+      3. ?                 →  $1, $2, ...
+    """
+    had_ignore = bool(_INSERT_OR_IGNORE_RE.search(sql))
+    sql = _INSERT_OR_IGNORE_RE.sub("INSERT", sql)
+    sql = _DATETIME_NOW_RE.sub("NOW()", sql)
+    sql = _translate_placeholders(sql)
+    if had_ignore:
+        sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+    return sql
 
 
 class PostgresBackend(DatabaseBackend):
@@ -129,7 +148,7 @@ class PostgresBackend(DatabaseBackend):
             self._conn = None
 
     async def execute(self, sql: str, params: tuple = ()) -> int:
-        result = await self._conn.execute(_translate_placeholders(sql), *params)
+        result = await self._conn.execute(_translate_sql(sql), *params)
         # asyncpg returns e.g. "UPDATE 3" — extract the count
         try:
             return int(result.split()[-1])
@@ -137,15 +156,15 @@ class PostgresBackend(DatabaseBackend):
             return 0
 
     async def fetch_all(self, sql: str, params: tuple = ()) -> list[tuple]:
-        rows = await self._conn.fetch(_translate_placeholders(sql), *params)
+        rows = await self._conn.fetch(_translate_sql(sql), *params)
         return [tuple(r) for r in rows]
 
     async def fetch_one(self, sql: str, params: tuple = ()) -> tuple | None:
-        row = await self._conn.fetchrow(_translate_placeholders(sql), *params)
+        row = await self._conn.fetchrow(_translate_sql(sql), *params)
         return tuple(row) if row else None
 
     async def executemany(self, sql: str, params_list: list[tuple]) -> None:
-        await self._conn.executemany(_translate_placeholders(sql), params_list)
+        await self._conn.executemany(_translate_sql(sql), params_list)
 
     async def commit(self) -> None:
         pass  # asyncpg uses implicit transactions; explicit commit via transaction context

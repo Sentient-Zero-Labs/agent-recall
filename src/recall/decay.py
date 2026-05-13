@@ -23,9 +23,7 @@ import math
 import os
 from datetime import datetime, timezone
 
-import aiosqlite
-
-from recall.db.connection import get_db_path
+from recall.db.backend import get_backend
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +62,8 @@ class DecayWorker:
         now = datetime.now(timezone.utc)
         updated = 0
 
-        async with aiosqlite.connect(get_db_path()) as db:
-            rows = await db.execute_fetchall(
+        async with get_backend() as db:
+            rows = await db.fetch_all(
                 "SELECT id, created_at, last_accessed, access_count "
                 "FROM memories WHERE valid_until IS NULL"
             )

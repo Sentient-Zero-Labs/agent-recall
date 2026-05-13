@@ -7,6 +7,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.5] — 2026-05
+
+### Changed
+- **Postgres backend fully wired**: `RECALL_DB_URL` now routes all server, worker, decay, A2A, and CLI queries through `PostgresBackend`. Previously the backend abstraction existed but `server.py` / `worker.py` / `decay.py` / `a2a.py` / `cli.py` / `logging.py` / `client.py` still used `aiosqlite` directly, making `RECALL_DB_URL` a no-op at runtime.
+- `db/connection.py` `init_db()` now detects `RECALL_DB_URL` and runs `_init_postgres()` (schema via `get_backend()`) vs `_init_sqlite()` (existing aiosqlite path). SQLite migrations (_v2/_v3/_v4) are skipped for Postgres — fresh Postgres deployments use the current schema directly.
+- SQL dialect translation (`INSERT OR IGNORE` → `ON CONFLICT DO NOTHING`, `datetime('now')` → `NOW()`) is applied automatically by `PostgresBackend._translate_sql()` at query time — application code stays in SQLite dialect.
+- `recall status` and `recall create-token` now respect `RECALL_DB_URL` for Postgres deployments.
+
+---
+
 ## [0.3.4] — 2026-05
 
 ### Changed

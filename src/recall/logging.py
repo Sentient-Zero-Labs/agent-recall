@@ -11,11 +11,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
-import aiosqlite
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
-from recall.db.connection import get_db_path
+from recall.db.backend import get_backend
 
 session_id_ctx: ContextVar[str] = ContextVar("session_id", default="")
 token_in_ctx: ContextVar[int] = ContextVar("token_in", default=0)
@@ -57,7 +56,7 @@ def hash_inputs(inputs: Any) -> str:
 
 
 async def insert_tool_call_record(record: ToolCallRecord) -> None:
-    async with aiosqlite.connect(get_db_path()) as db:
+    async with get_backend() as db:
         await db.execute(
             """INSERT INTO tool_call_records
                (id, tool_name, namespace, session_id, inputs_hash, status, error_code,

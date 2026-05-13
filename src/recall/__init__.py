@@ -1,6 +1,6 @@
 """Recall — persistent memory layer for AI agents."""
 
-__version__ = "0.3.4"
+__version__ = "0.3.6"
 
 from recall.client import MemoryClient
 from recall.models import MemoryUnit

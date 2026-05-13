@@ -10,10 +10,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-import aiosqlite
 import anthropic
 
-from recall.db.connection import get_db_path
+from recall.db.backend import get_backend
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +126,7 @@ class ExtractionWorker:
         session_id = job.get("session_id", "")
         agent_id = job.get("agent_id", "")
 
-        async with aiosqlite.connect(get_db_path()) as db:
+        async with get_backend() as db:
             await db.execute(
                 "UPDATE operations SET status = 'processing', updated_at = datetime('now') "
                 "WHERE id = ?",
@@ -145,7 +144,7 @@ class ExtractionWorker:
             )
             memories = _extract_stub_fallback(namespace, text, topic, job_id)
 
-        async with aiosqlite.connect(get_db_path()) as db:
+        async with get_backend() as db:
             for memory in memories:
                 await _handle_contradiction(db, memory, namespace)
                 await db.execute(
@@ -282,7 +281,7 @@ async def _handle_contradiction(db: Any, memory: dict, namespace: str) -> None:
     """Mark conflicting active memories as superseded when entity+attribute match but value differs."""
     if not memory.get("entity") or not memory.get("attribute"):
         return
-    existing = await db.execute_fetchall(
+    existing = await db.fetch_all(
         "SELECT id FROM memories WHERE namespace = ? AND entity = ? AND attribute = ? "
         "AND valid_until IS NULL AND (value IS NULL OR value != ?)",
         (namespace, memory["entity"], memory["attribute"], memory["value"]),
