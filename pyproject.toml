@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "szl-recall"
-version = "0.3.0"
+version = "0.3.4"
 description = "Persistent memory layer for AI agents. Local-first. Inspectable. Framework-agnostic."
 readme = "README.md"
 license = { text = "MIT" }

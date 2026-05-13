@@ -13,7 +13,7 @@ import aiosqlite
 import pytest
 
 from recall.db.connection import get_db_path
-from recall.server import consolidate_memories, user_id_ctx
+from recall.server import consolidate_memories, namespace_ctx
 
 _needs_api = pytest.mark.skipif(
     not os.environ.get("ANTHROPIC_API_KEY"),
@@ -22,15 +22,15 @@ _needs_api = pytest.mark.skipif(
 
 
 @pytest.fixture
-def set_user(user_id):
-    """Set user_id_ctx for the duration of a test."""
-    token = user_id_ctx.set(user_id)
+def set_user(namespace):
+    """Set namespace_ctx for the duration of a test."""
+    token = namespace_ctx.set(namespace)
     yield
-    user_id_ctx.reset(token)
+    namespace_ctx.reset(token)
 
 
 class TestConsolidationEdgeCases:
-    async def test_empty_topic_returns_ok(self, client, user_id, set_user, monkeypatch):
+    async def test_empty_topic_returns_ok(self, client, namespace, set_user, monkeypatch):
         """No memories in topic → ok with zeros, no LLM call needed."""
         _patch_embed(monkeypatch)
         result = await consolidate_memories(topic="nonexistent-topic")
@@ -39,23 +39,23 @@ class TestConsolidationEdgeCases:
         assert result["data"]["memories_consolidated"] == 0
         assert result["data"]["deleted_ids"] == []
 
-    async def test_single_memory_topic_noop(self, client, user_id, set_user, monkeypatch):
+    async def test_single_memory_topic_noop(self, client, namespace, set_user, monkeypatch):
         """One memory in topic → no merge possible, return ok with zeros."""
         _patch_embed(monkeypatch)
-        await client.store(user_id, "User prefers Python for backend work", "solo-topic")
+        await client.store(namespace, "User prefers Python for backend work", "solo-topic")
         result = await consolidate_memories(topic="solo-topic")
         assert result["status"] == "ok"
         assert result["data"]["groups_found"] == 0
         assert result["data"]["memories_consolidated"] == 0
 
-    async def test_embeddings_required_error(self, client, user_id, set_user, monkeypatch):
+    async def test_embeddings_required_error(self, client, namespace, set_user, monkeypatch):
         """When embed() returns None, must return EMBEDDINGS_REQUIRED error."""
         monkeypatch.setattr("recall.server.embed", lambda texts: None, raising=False)
         from recall import server as s
         monkeypatch.setattr(s, "embed", lambda texts: None)
 
-        await client.store(user_id, "User likes Python", "tech")
-        await client.store(user_id, "User prefers Python", "tech")
+        await client.store(namespace, "User likes Python", "tech")
+        await client.store(namespace, "User prefers Python", "tech")
 
         # Patch at the import point inside the tool
         with patch("recall.embeddings.embed", return_value=None):
@@ -64,13 +64,13 @@ class TestConsolidationEdgeCases:
         assert result["status"] == "error"
         assert result["code"] == "EMBEDDINGS_REQUIRED"
 
-    async def test_dry_run_no_mutations(self, client, user_id, set_user, monkeypatch):
+    async def test_dry_run_no_mutations(self, client, namespace, set_user, monkeypatch):
         """dry_run=True must return a plan without modifying the database."""
         _patch_embed(monkeypatch, similar=True)
         _patch_llm_merge(monkeypatch)
 
-        await client.store(user_id, "User uses Python for backend development", "tech")
-        await client.store(user_id, "User prefers Python for backend services", "tech")
+        await client.store(namespace, "User uses Python for backend development", "tech")
+        await client.store(namespace, "User prefers Python for backend services", "tech")
 
         result = await consolidate_memories(topic="tech", dry_run=True)
 
@@ -80,20 +80,20 @@ class TestConsolidationEdgeCases:
         # Database must be unchanged
         async with aiosqlite.connect(get_db_path()) as db:
             rows = await db.execute_fetchall(
-                "SELECT id FROM memories WHERE user_id = ? AND topic = ? AND valid_until IS NULL",
-                (user_id, "tech"),
+                "SELECT id FROM memories WHERE namespace = ? AND topic = ? AND valid_until IS NULL",
+                (namespace, "tech"),
             )
         assert len(rows) == 2, "dry_run must not supersede any memories"
 
-    async def test_topic_isolation(self, client, user_id, set_user, monkeypatch):
+    async def test_topic_isolation(self, client, namespace, set_user, monkeypatch):
         """Consolidating topic A must not touch memories in topic B."""
         _patch_embed(monkeypatch, similar=True)
         _patch_llm_merge(monkeypatch)
 
-        await client.store(user_id, "User uses Python for backend development", "tech")
-        await client.store(user_id, "User prefers Python for backend services", "tech")
-        b1 = await client.store(user_id, "User goes hiking every weekend", "personal")
-        b2 = await client.store(user_id, "User enjoys outdoor activities on weekends", "personal")
+        await client.store(namespace, "User uses Python for backend development", "tech")
+        await client.store(namespace, "User prefers Python for backend services", "tech")
+        b1 = await client.store(namespace, "User goes hiking every weekend", "personal")
+        b2 = await client.store(namespace, "User enjoys outdoor activities on weekends", "personal")
 
         await consolidate_memories(topic="tech")
 
@@ -105,13 +105,13 @@ class TestConsolidationEdgeCases:
             )
         assert len(rows) == 2, "consolidation must not affect memories in other topics"
 
-    async def test_consolidation_result_shape(self, client, user_id, set_user, monkeypatch):
+    async def test_consolidation_result_shape(self, client, namespace, set_user, monkeypatch):
         """Response shape must include all required fields."""
         _patch_embed(monkeypatch, similar=True)
         _patch_llm_merge(monkeypatch)
 
-        await client.store(user_id, "User uses Python for backend development", "tech")
-        await client.store(user_id, "User prefers Python for backend services", "tech")
+        await client.store(namespace, "User uses Python for backend development", "tech")
+        await client.store(namespace, "User prefers Python for backend services", "tech")
 
         result = await consolidate_memories(topic="tech")
 
@@ -126,7 +126,7 @@ class TestConsolidationEdgeCases:
         assert data["dry_run"] is False
 
     @_needs_api
-    async def test_live_merge_supersedes_originals(self, client, user_id, set_user):
+    async def test_live_merge_supersedes_originals(self, client, namespace, set_user):
         """Live test: merged memories must be superseded, canonical memory must be created."""
         from recall.embeddings import embed, vec_to_blob
 
@@ -142,7 +142,7 @@ class TestConsolidationEdgeCases:
             pytest.skip("embeddings not available")
 
         for i, text in enumerate(texts):
-            m = await client.store(user_id, text, "tech-live")
+            m = await client.store(namespace, text, "tech-live")
             ids.append(m.id)
 
         result = await consolidate_memories(topic="tech-live", similarity_threshold=0.7)

@@ -33,7 +33,7 @@ async def server(tmp_path, monkeypatch):
     # Seed test token before any request hits the auth middleware
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
-            "INSERT INTO api_tokens (id, token_hash, user_id, revoked) VALUES (?,?,?,0)",
+            "INSERT INTO api_tokens (id, token_hash, namespace, revoked) VALUES (?,?,?,0)",
             (str(uuid.uuid4()), hash_token(TEST_TOKEN), TEST_USER),
         )
         await db.commit()

@@ -18,7 +18,7 @@ def main() -> None:
     serve = subparsers.add_parser("serve", help="Start the Recall MCP server.")
     serve.add_argument("--host", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=8000)
-    serve.add_argument("--db", default="recall.db", help="Path to SQLite database.")
+    serve.add_argument("--db", default=None, help="Path to SQLite database. Overrides RECALL_DB_PATH env var.")
     serve.add_argument("--reload", action="store_true", help="Auto-reload on code changes.")
 
     # status
@@ -26,8 +26,8 @@ def main() -> None:
     status.add_argument("--db", default="recall.db")
 
     # create-token
-    ct = subparsers.add_parser("create-token", help="Generate an API token for a user.")
-    ct.add_argument("user_id", help="User ID to associate with this token (any string).")
+    ct = subparsers.add_parser("create-token", help="Generate an API token for a namespace (user, agent, project, etc.).")
+    ct.add_argument("namespace", help="Namespace to associate with this token — can be a user, agent, project, or any string.")
     ct.add_argument("--db", default="recall.db", help="Path to SQLite database.")
 
     args = parser.parse_args()
@@ -42,7 +42,14 @@ def main() -> None:
 
 def _cmd_serve(args: argparse.Namespace) -> None:
     import os
-    os.environ.setdefault("RECALL_DB_PATH", args.db)
+    from recall.db.connection import set_db_path
+
+    # --db flag > RECALL_DB_PATH env var > default "recall.db"
+    # set_db_path updates the already-imported module-level variable so the
+    # module-level import race (connection.py reads env at import time) is bypassed.
+    db_path = args.db or os.environ.get("RECALL_DB_PATH", "recall.db")
+    set_db_path(db_path)
+    os.environ["RECALL_DB_PATH"] = db_path  # keep env consistent for any subprocesses
 
     try:
         import uvicorn
@@ -86,12 +93,12 @@ async def _cmd_create_token(args: argparse.Namespace) -> None:
 
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
-            "INSERT INTO api_tokens (id, token_hash, user_id, revoked) VALUES (?, ?, ?, 0)",
-            (token_id, token_hash, args.user_id),
+            "INSERT INTO api_tokens (id, token_hash, namespace, revoked) VALUES (?, ?, ?, 0)",
+            (token_id, token_hash, args.namespace),
         )
         await db.commit()
 
-    print(f"Token created for user: {args.user_id}")
+    print(f"Token created for namespace: {args.namespace}")
     print(f"\n  Bearer {raw_token}\n")
     print("Store this token securely — it will not be shown again.")
     print("Add it to your MCP client as: Authorization: Bearer <token>")

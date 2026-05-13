@@ -7,16 +7,45 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [0.3.4] — 2026-05
 
-### Planned (v0.2 — Memory series)
-- LLM-based extraction pipeline (structured fact extraction from conversation transcripts)
-- Vector embeddings via `sentence-transformers` (all-MiniLM-L6-v2)
-- Hybrid search: BM25 + cosine similarity merged with RRF (k=60)
-- Contradiction detection and `superseded_by` resolution
-- Decay scoring for memory relevance over time
-- Postgres + pgvector support (optional `postgres` dependency group)
-- `get_job_status` tool for checking extraction progress
+### Changed
+- `delete_user_data` tool renamed to `delete_namespace_data` to match the `namespace` terminology used everywhere else.
+- `store_memory`: `idempotency_key` parameter is now optional (default `""`). When omitted, a UUID is auto-generated so callers don't need to supply one.
+- `__version__` in `recall/__init__.py` updated to match `pyproject.toml`.
+
+---
+
+## [0.3.3] — 2026-05
+
+### Changed
+- **`user_id` renamed to `namespace`** across all DB columns, Python code, and CLI. Existing DBs are migrated automatically on startup via `ALTER TABLE ... RENAME COLUMN`. No data loss.
+- `recall create-token` positional arg is now named `namespace` in help text and output
+- MMR reranking: relevance signal now uses normalised hybrid scores (recency + decay + BM25 + density) instead of raw cosine similarity. At `mmr_lambda=1.0`, output order now correctly matches hybrid ranking order.
+
+### Fixed
+- MMR was skipped when `len(candidates) == limit` (the most common case). Guard condition corrected — MMR now always runs when embeddings are available.
+- `recall serve --db <path>` now correctly overrides `RECALL_DB_PATH`. Previously the `--db` flag was silently ignored due to a module-level import race.
+
+---
+
+## [0.3.0] — 2026-05
+
+### Added
+- **MMR diversification** (`mmr_lambda` param on `search_memories`): post-ranking reorder using Max-Marginal Relevance. Set `mmr_lambda=0.3` for high diversity, `1.0` for pure relevance. Requires `sentence-transformers` for full effect; falls back to BM25 order if model unavailable.
+- **Context budget trimming** (`max_tokens` param on `search_memories`): greedy trim of results to fit a token budget (4 chars/token heuristic). Always includes at least 1 result.
+- **Score threshold filtering** (`score_threshold` param on `search_memories`): drop candidates below a hybrid score floor before MMR.
+- **`delete_namespace_data` MCP tool** (7th tool): GDPR-style erasure. Deletes all memories, operations, A2A tasks, and tool call records for the namespace. Revokes all tokens. Requires `confirm="DELETE MY DATA"`.
+- **A2A task persistence**: `a2a_tasks` table stores task state in SQLite. Tasks survive server restarts. In-memory `_tasks` dict is now a write-through cache.
+- **Postgres backend**: set `RECALL_DB_URL=postgresql://...` to use asyncpg + connection pooling instead of SQLite. Automatic `?` → `$1, $2, ...` placeholder translation. SQLite remains the default.
+- `TROUBLESHOOTING.md` covering 5 common deployment issues.
+- `sentence-transformers` 5.5.0 validated; all MMR tests pass with embeddings installed.
+- 92-test suite (was 63 in v0.2).
+
+### Architecture
+- `_migrate_v3()` adds `a2a_tasks` table to existing DBs on startup.
+- `DatabaseBackend` ABC with `SQLiteBackend` and `PostgresBackend` implementations.
+- Factory `get_backend()` selects backend from `RECALL_DB_URL` env var.
 
 ---
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from recall.server import _apply_budget, _estimate_tokens, search_memories, user_id_ctx
+from recall.server import _apply_budget, _estimate_tokens, search_memories, namespace_ctx
 
 
 class TestTokenEstimation:
@@ -61,38 +61,38 @@ class TestApplyBudget:
 
 
 class TestMaxTokensInSearchMemories:
-    async def test_max_tokens_param_trims_results(self, client, user_id):
+    async def test_max_tokens_param_trims_results(self, client, namespace):
         """max_tokens parameter on search_memories reduces results to fit budget."""
         # Store several memories with long texts
         for i in range(5):
             await client.store(
-                user_id,
+                namespace,
                 f"Python backend development preference statement number {i} " * 10,
                 "tech",
             )
 
-        token = user_id_ctx.set(user_id)
+        token = namespace_ctx.set(namespace)
         try:
             # Very small budget — should return fewer results than default
             small = await search_memories(query="Python backend", limit=10, max_tokens=50)
             large = await search_memories(query="Python backend", limit=10, max_tokens=100_000)
         finally:
-            user_id_ctx.reset(token)
+            namespace_ctx.reset(token)
 
         assert small["status"] == "ok"
         assert large["status"] == "ok"
         assert small["data"]["total"] <= large["data"]["total"]
 
-    async def test_max_tokens_none_returns_all(self, client, user_id):
+    async def test_max_tokens_none_returns_all(self, client, namespace):
         """max_tokens=None (default) returns all results without truncation."""
         for i in range(3):
-            await client.store(user_id, f"Python backend preference {i}", "tech")
+            await client.store(namespace, f"Python backend preference {i}", "tech")
 
-        token = user_id_ctx.set(user_id)
+        token = namespace_ctx.set(namespace)
         try:
             result = await search_memories(query="Python backend", limit=10, max_tokens=None)
         finally:
-            user_id_ctx.reset(token)
+            namespace_ctx.reset(token)
 
         assert result["status"] == "ok"
         assert result["data"]["total"] >= 1

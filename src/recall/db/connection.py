@@ -38,7 +38,7 @@ async def _migrate_v2(db: aiosqlite.Connection) -> None:
     try:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_memories_entity_attr "
-            "ON memories(user_id, entity, attribute) WHERE valid_until IS NULL"
+            "ON memories(namespace, entity, attribute) WHERE valid_until IS NULL"
         )
     except Exception:
         pass
@@ -50,7 +50,7 @@ async def _migrate_v3(db: aiosqlite.Connection) -> None:
     await db.execute(
         """CREATE TABLE IF NOT EXISTS a2a_tasks (
             id          TEXT PRIMARY KEY,
-            user_id     TEXT NOT NULL,
+            namespace     TEXT NOT NULL,
             status      TEXT NOT NULL DEFAULT 'submitted',
             input       TEXT NOT NULL,
             output      TEXT,
@@ -62,8 +62,31 @@ async def _migrate_v3(db: aiosqlite.Connection) -> None:
         )"""
     )
     await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_a2a_user ON a2a_tasks(user_id)"
+        "CREATE INDEX IF NOT EXISTS idx_a2a_user ON a2a_tasks(namespace)"
     )
+    await db.commit()
+
+
+async def _migrate_v4(db: aiosqlite.Connection) -> None:
+    """Rename user_id → namespace across all tables (v4 — SQLite 3.25+ RENAME COLUMN)."""
+    renames = [
+        ("memories",          "user_id", "namespace"),
+        ("operations",        "user_id", "namespace"),
+        ("api_tokens",        "user_id", "namespace"),
+        ("tool_call_records", "user_id", "namespace"),
+        ("a2a_tasks",         "user_id", "namespace"),
+    ]
+    for table, old_col, new_col in renames:
+        try:
+            # Check if old column still exists before renaming
+            info = await db.execute_fetchall(f"PRAGMA table_info({table})")
+            cols = [row[1] for row in info]
+            if old_col in cols and new_col not in cols:
+                await db.execute(
+                    f"ALTER TABLE {table} RENAME COLUMN {old_col} TO {new_col}"
+                )
+        except Exception:
+            pass  # already renamed or table doesn't exist
     await db.commit()
 
 
@@ -81,6 +104,7 @@ async def init_db() -> None:
 
         await _migrate_v2(db)
         await _migrate_v3(db)
+        await _migrate_v4(db)
 
 
 def get_db_path() -> Path:

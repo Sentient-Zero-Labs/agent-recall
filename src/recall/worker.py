@@ -85,10 +85,10 @@ class ExtractionWorker:
         logger.info("extraction_worker_stopped")
 
     async def extract(
-        self, user_id: str, text: str, topic: str, job_id: str
+        self, namespace: str, text: str, topic: str, job_id: str
     ) -> list[dict]:
         """Public extraction interface — used by A2A and other synchronous callers."""
-        return await self._extract_with_llm(user_id, text, topic, job_id)
+        return await self._extract_with_llm(namespace, text, topic, job_id)
 
     async def enqueue(self, job: dict[str, Any]) -> None:
         """Add a job to the extraction queue. Non-blocking: raises QueueFull if at capacity."""
@@ -97,7 +97,7 @@ class ExtractionWorker:
         except asyncio.QueueFull:
             logger.warning(
                 "extraction_queue_full",
-                extra={"job_id": job.get("job_id"), "user_id": job.get("user_id")},
+                extra={"job_id": job.get("job_id"), "namespace": job.get("namespace")},
             )
             raise
 
@@ -121,7 +121,7 @@ class ExtractionWorker:
     async def _process(self, job: dict[str, Any]) -> None:
         """Process one extraction job using LLM extraction with stub fallback."""
         job_id = job["job_id"]
-        user_id = job["user_id"]
+        namespace = job["namespace"]
         text = job["text"]
         topic = job.get("topic", "general")
         session_id = job.get("session_id", "")
@@ -136,27 +136,27 @@ class ExtractionWorker:
             await db.commit()
 
         try:
-            memories = await self._extract_with_llm(user_id, text, topic, job_id)
+            memories = await self._extract_with_llm(namespace, text, topic, job_id)
         except Exception as exc:
             logger.error(
                 "extraction_llm_failed",
-                extra={"job_id": job_id, "user_id": user_id, "error": str(exc)},
+                extra={"job_id": job_id, "namespace": namespace, "error": str(exc)},
                 exc_info=True,
             )
-            memories = _extract_stub_fallback(user_id, text, topic, job_id)
+            memories = _extract_stub_fallback(namespace, text, topic, job_id)
 
         async with aiosqlite.connect(get_db_path()) as db:
             for memory in memories:
-                await _handle_contradiction(db, memory, user_id)
+                await _handle_contradiction(db, memory, namespace)
                 await db.execute(
                     """INSERT OR IGNORE INTO memories
-                       (id, user_id, text, type, topic, importance, confidence,
+                       (id, namespace, text, type, topic, importance, confidence,
                         source_session, created_at, entity, attribute, value,
                         valid_from, session_id, agent_id)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         memory["id"],
-                        memory["user_id"],
+                        memory["namespace"],
                         memory["text"],
                         memory["type"],
                         memory["topic"],
@@ -181,11 +181,11 @@ class ExtractionWorker:
 
         logger.info(
             "extraction_complete",
-            extra={"job_id": job_id, "user_id": user_id, "memories_stored": len(memories)},
+            extra={"job_id": job_id, "namespace": namespace, "memories_stored": len(memories)},
         )
 
     async def _extract_with_llm(
-        self, user_id: str, text: str, topic: str, source_session: str
+        self, namespace: str, text: str, topic: str, source_session: str
     ) -> list[dict]:
         """Call the Anthropic API to extract structured memories from conversation text.
 
@@ -252,7 +252,7 @@ class ExtractionWorker:
             memories.append(
                 {
                     "id": str(uuid.uuid4()),
-                    "user_id": user_id,
+                    "namespace": namespace,
                     "text": mem_text,
                     "type": mem_type,
                     "topic": topic,
@@ -271,21 +271,21 @@ class ExtractionWorker:
             "extraction_llm_success",
             extra={
                 "job_id": source_session,
-                "user_id": user_id,
+                "namespace": namespace,
                 "memories_extracted": len(memories),
             },
         )
         return memories
 
 
-async def _handle_contradiction(db: Any, memory: dict, user_id: str) -> None:
+async def _handle_contradiction(db: Any, memory: dict, namespace: str) -> None:
     """Mark conflicting active memories as superseded when entity+attribute match but value differs."""
     if not memory.get("entity") or not memory.get("attribute"):
         return
     existing = await db.execute_fetchall(
-        "SELECT id FROM memories WHERE user_id = ? AND entity = ? AND attribute = ? "
+        "SELECT id FROM memories WHERE namespace = ? AND entity = ? AND attribute = ? "
         "AND valid_until IS NULL AND (value IS NULL OR value != ?)",
-        (user_id, memory["entity"], memory["attribute"], memory["value"]),
+        (namespace, memory["entity"], memory["attribute"], memory["value"]),
     )
     for (ex_id,) in existing:
         await db.execute(
@@ -295,14 +295,14 @@ async def _handle_contradiction(db: Any, memory: dict, user_id: str) -> None:
 
 
 def _extract_stub_fallback(
-    user_id: str, text: str, topic: str, source_session: str
+    namespace: str, text: str, topic: str, source_session: str
 ) -> list[dict]:
     """Fallback stub — returns the raw text as a single fact memory when LLM extraction fails."""
     now = datetime.now(timezone.utc).isoformat()
     return [
         {
             "id": str(uuid.uuid4()),
-            "user_id": user_id,
+            "namespace": namespace,
             "text": text[:500],  # truncate to 500 chars
             "type": "fact",
             "topic": topic,

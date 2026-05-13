@@ -32,7 +32,7 @@ _MODEL_RATES: dict[str, tuple[float, float]] = {
 class ToolCallRecord:
     id: str
     tool_name: str
-    user_id: str
+    namespace: str
     session_id: str
     inputs_hash: str
     status: Literal["success", "error", "timeout"]
@@ -60,13 +60,13 @@ async def insert_tool_call_record(record: ToolCallRecord) -> None:
     async with aiosqlite.connect(get_db_path()) as db:
         await db.execute(
             """INSERT INTO tool_call_records
-               (id, tool_name, user_id, session_id, inputs_hash, status, error_code,
+               (id, tool_name, namespace, session_id, inputs_hash, status, error_code,
                 duration_ms, llm_tokens_in, llm_tokens_out, cost_usd, timestamp)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 record.id,
                 record.tool_name,
-                record.user_id,
+                record.namespace,
                 record.session_id,
                 record.inputs_hash,
                 record.status,
@@ -88,9 +88,9 @@ class LoggingMiddleware(BaseHTTPMiddleware):
     other MCP protocol messages are passed through without logging.
     """
 
-    def __init__(self, app: Any, user_id_ctx: ContextVar[str]) -> None:
+    def __init__(self, app: Any, namespace_ctx: ContextVar[str]) -> None:
         super().__init__(app)
-        self._user_id_ctx = user_id_ctx
+        self._namespace_ctx = namespace_ctx
 
     async def dispatch(self, request: Request, call_next: Any) -> Any:
         body = b""
@@ -132,7 +132,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             record = ToolCallRecord(
                 id=str(uuid.uuid4()),
                 tool_name=tool_name,
-                user_id=self._user_id_ctx.get(),
+                namespace=self._namespace_ctx.get(),
                 session_id=session_id_ctx.get(),
                 inputs_hash=hash_inputs(inputs_data),
                 status=status,

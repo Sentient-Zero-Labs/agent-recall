@@ -27,7 +27,7 @@ class MemoryUnit:
     """
 
     id: str
-    user_id: str
+    namespace: str
     text: str                           # extracted natural-language fact
     type: MemoryType
     topic: str
@@ -77,7 +77,7 @@ class MemoryUnit:
         """Serialise to a plain dict suitable for JSON responses or DB insertion."""
         return {
             "id": self.id,
-            "user_id": self.user_id,
+            "namespace": self.namespace,
             "text": self.text,
             "type": self.type.value,
             "topic": self.topic,

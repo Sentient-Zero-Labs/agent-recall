@@ -36,7 +36,7 @@ class MemoryClient:
 
     async def store(
         self,
-        user_id: str,
+        namespace: str,
         text: str,
         topic: str,
         memory_type: MemoryType = MemoryType.FACT,
@@ -49,7 +49,7 @@ class MemoryClient:
         """
         memory = MemoryUnit(
             id=str(uuid.uuid4()),
-            user_id=user_id,
+            namespace=namespace,
             text=text,
             type=memory_type,
             topic=topic,
@@ -61,12 +61,12 @@ class MemoryClient:
         async with aiosqlite.connect(get_db_path()) as db:
             await db.execute(
                 """INSERT INTO memories
-                   (id, user_id, text, type, topic, importance, confidence,
+                   (id, namespace, text, type, topic, importance, confidence,
                     source_session, created_at)
                    VALUES (?,?,?,?,?,?,?,?,?)""",
                 (
                     memory.id,
-                    memory.user_id,
+                    memory.namespace,
                     memory.text,
                     memory.type.value,
                     memory.topic,
@@ -81,65 +81,65 @@ class MemoryClient:
 
     # ── Read ───────────────────────────────────────────────────────────────
 
-    async def get(self, memory_id: str, user_id: str) -> MemoryUnit | None:
+    async def get(self, memory_id: str, namespace: str) -> MemoryUnit | None:
         async with aiosqlite.connect(get_db_path()) as db:
             rows = await db.execute_fetchall(
-                "SELECT id, user_id, text, type, topic, importance, confidence, "
+                "SELECT id, namespace, text, type, topic, importance, confidence, "
                 "source_session, created_at, last_accessed, access_count "
-                "FROM memories WHERE id = ? AND user_id = ?",
-                (memory_id, user_id),
+                "FROM memories WHERE id = ? AND namespace = ?",
+                (memory_id, namespace),
             )
         if not rows:
             return None
         return _row_to_memory_unit(rows[0])
 
     async def search(
-        self, user_id: str, query: str, limit: int = 20
+        self, namespace: str, query: str, limit: int = 20
     ) -> list[MemoryUnit]:
         """Simple keyword search. Thin wrapper — use MCP tool for production."""
         async with aiosqlite.connect(get_db_path()) as db:
             rows = await db.execute_fetchall(
-                "SELECT id, user_id, text, type, topic, importance, confidence, "
+                "SELECT id, namespace, text, type, topic, importance, confidence, "
                 "source_session, created_at, last_accessed, access_count "
-                "FROM memories WHERE user_id = ? AND text LIKE ? LIMIT ?",
-                (user_id, f"%{query}%", limit),
+                "FROM memories WHERE namespace = ? AND text LIKE ? LIMIT ?",
+                (namespace, f"%{query}%", limit),
             )
         return [_row_to_memory_unit(r) for r in rows]
 
     async def list_all(
-        self, user_id: str, limit: int = 20, offset: int = 0
+        self, namespace: str, limit: int = 20, offset: int = 0
     ) -> tuple[list[MemoryUnit], int]:
         """Return (memories, total_count)."""
         async with aiosqlite.connect(get_db_path()) as db:
             rows = await db.execute_fetchall(
-                "SELECT id, user_id, text, type, topic, importance, confidence, "
+                "SELECT id, namespace, text, type, topic, importance, confidence, "
                 "source_session, created_at, last_accessed, access_count "
-                "FROM memories WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                (user_id, limit, offset),
+                "FROM memories WHERE namespace = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (namespace, limit, offset),
             )
             count_rows = await db.execute_fetchall(
-                "SELECT COUNT(*) FROM memories WHERE user_id = ?", (user_id,)
+                "SELECT COUNT(*) FROM memories WHERE namespace = ?", (namespace,)
             )
         total = count_rows[0][0]
         return [_row_to_memory_unit(r) for r in rows], total
 
     # ── Delete ─────────────────────────────────────────────────────────────
 
-    async def delete(self, memory_id: str, user_id: str) -> bool:
+    async def delete(self, memory_id: str, namespace: str) -> bool:
         """Returns True if deleted, False if not found."""
         async with aiosqlite.connect(get_db_path()) as db:
             cursor = await db.execute(
-                "DELETE FROM memories WHERE id = ? AND user_id = ?",
-                (memory_id, user_id),
+                "DELETE FROM memories WHERE id = ? AND namespace = ?",
+                (memory_id, namespace),
             )
             await db.commit()
         return cursor.rowcount > 0
 
-    async def delete_all(self, user_id: str) -> int:
+    async def delete_all(self, namespace: str) -> int:
         """Delete all memories for a user. Returns count deleted."""
         async with aiosqlite.connect(get_db_path()) as db:
             cursor = await db.execute(
-                "DELETE FROM memories WHERE user_id = ?", (user_id,)
+                "DELETE FROM memories WHERE namespace = ?", (namespace,)
             )
             await db.commit()
         return cursor.rowcount
@@ -148,7 +148,7 @@ class MemoryClient:
 def _row_to_memory_unit(row: tuple) -> MemoryUnit:
     return MemoryUnit(
         id=row[0],
-        user_id=row[1],
+        namespace=row[1],
         text=row[2],
         type=MemoryType(row[3]),
         topic=row[4] or "",

@@ -60,9 +60,9 @@ _NEGATION_TOKENS = frozenset(
 async def _db_insert_task(task: dict[str, Any]) -> None:
     async with aiosqlite.connect(get_db_path()) as db:
         await db.execute(
-            "INSERT INTO a2a_tasks (id, user_id, status, input, created_at, updated_at) "
+            "INSERT INTO a2a_tasks (id, namespace, status, input, created_at, updated_at) "
             "VALUES (?, ?, 'submitted', ?, datetime('now'), datetime('now'))",
-            (task["id"], task["user_id"], json.dumps(task["input"])),
+            (task["id"], task["namespace"], json.dumps(task["input"])),
         )
         await db.commit()
 
@@ -87,7 +87,7 @@ async def _db_update_task(task: dict[str, Any]) -> None:
 async def _db_load_task(task_id: str) -> dict[str, Any] | None:
     async with aiosqlite.connect(get_db_path()) as db:
         rows = await db.execute_fetchall(
-            "SELECT id, user_id, status, input, output, message, pending, resolution "
+            "SELECT id, namespace, status, input, output, message, pending, resolution "
             "FROM a2a_tasks WHERE id = ?",
             (task_id,),
         )
@@ -96,7 +96,7 @@ async def _db_load_task(task_id: str) -> dict[str, Any] | None:
     r = rows[0]
     return {
         "id": r[0],
-        "user_id": r[1],
+        "namespace": r[1],
         "status": r[2],
         "input": json.loads(r[3]),
         "output": json.loads(r[4]) if r[4] else None,
@@ -117,7 +117,7 @@ async def _agent_card(request: Request) -> JSONResponse:
     return JSONResponse(card)
 
 
-async def _create_task(request: Request, user_id_ctx: ContextVar[str]) -> JSONResponse:
+async def _create_task(request: Request, namespace_ctx: ContextVar[str]) -> JSONResponse:
     """POST /a2a — submit a consolidation task."""
     try:
         body = await request.json()
@@ -138,12 +138,12 @@ async def _create_task(request: Request, user_id_ctx: ContextVar[str]) -> JSONRe
         return JSONResponse({"error": "input.text is required and must not be empty."}, status_code=400)
 
     task_id = body.get("id") or str(uuid.uuid4())
-    user_id = user_id_ctx.get()
+    namespace = namespace_ctx.get()
 
     task: dict[str, Any] = {
         "id": task_id,
         "status": "submitted",
-        "user_id": user_id,
+        "namespace": namespace,
         "input": {"text": text, "topic": topic},
         "output": None,
         "message": None,
@@ -214,7 +214,7 @@ async def _run_consolidation(task_id: str) -> None:
 
     task["status"] = "working"
     await _db_update_task(task)
-    user_id = task["user_id"]
+    namespace = task["namespace"]
     text = task["input"]["text"]
     topic = task["input"]["topic"]
     job_id = str(uuid.uuid4())
@@ -226,10 +226,10 @@ async def _run_consolidation(task_id: str) -> None:
     try:
         if worker is None:
             raise RuntimeError("extraction_worker not started")
-        memories = await worker.extract(user_id, text, topic, job_id)
+        memories = await worker.extract(namespace, text, topic, job_id)
     except Exception as exc:
         logger.warning("a2a_llm_fallback", extra={"task_id": task_id, "error": str(exc)})
-        memories = _extract_stub_fallback(user_id, text, topic, job_id)
+        memories = _extract_stub_fallback(namespace, text, topic, job_id)
 
     if not memories:
         task["status"] = "completed"
@@ -237,7 +237,7 @@ async def _run_consolidation(task_id: str) -> None:
         await _db_update_task(task)
         return
 
-    contradictions = await _detect_contradictions(user_id, memories)
+    contradictions = await _detect_contradictions(namespace, memories)
 
     if contradictions:
         task["status"] = "input-required"
@@ -303,13 +303,13 @@ async def _apply_resolution(task_id: str) -> None:
 
 
 async def _detect_contradictions(
-    user_id: str, new_memories: list[dict]
+    namespace: str, new_memories: list[dict]
 ) -> list[dict]:
     """Heuristic: shared 3+ tokens AND negation word present in either memory."""
     async with aiosqlite.connect(get_db_path()) as db:
         existing = await db.execute_fetchall(
-            "SELECT id, text FROM memories WHERE user_id = ?",
-            (user_id,),
+            "SELECT id, text FROM memories WHERE namespace = ?",
+            (namespace,),
         )
 
     contradictions: list[dict] = []
@@ -335,11 +335,11 @@ async def _bulk_store(memories: list[dict]) -> int:
         for m in memories:
             await db.execute(
                 """INSERT OR IGNORE INTO memories
-                   (id, user_id, text, type, topic, importance, confidence,
+                   (id, namespace, text, type, topic, importance, confidence,
                     source_session, created_at, entity, attribute, value, valid_from)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    m["id"], m["user_id"], m["text"], m["type"],
+                    m["id"], m["namespace"], m["text"], m["type"],
                     m["topic"], m["importance"], m["confidence"],
                     m["source_session"], m["created_at"],
                     m.get("entity"), m.get("attribute"), m.get("value"),
@@ -353,11 +353,11 @@ async def _bulk_store(memories: list[dict]) -> int:
 # ── Router factories ──────────────────────────────────────────────────────────
 
 
-def create_a2a_router(user_id_ctx: ContextVar[str]) -> Router:
+def create_a2a_router(namespace_ctx: ContextVar[str]) -> Router:
     """Create the /a2a task router, bound to the auth context var from server.py."""
 
     async def create_task(request: Request) -> JSONResponse:
-        return await _create_task(request, user_id_ctx)
+        return await _create_task(request, namespace_ctx)
 
     return Router(
         routes=[

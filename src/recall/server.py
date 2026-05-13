@@ -29,7 +29,7 @@ from recall.worker import ExtractionWorker
 
 logger = logging.getLogger(__name__)
 
-user_id_ctx: ContextVar[str] = ContextVar("user_id", default="")
+namespace_ctx: ContextVar[str] = ContextVar("namespace", default="")
 extraction_worker: ExtractionWorker | None = None
 decay_worker: DecayWorker | None = None
 
@@ -54,10 +54,10 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
         token = auth.removeprefix("Bearer ").strip()
-        user_id = await _validate_token(token)
-        if not user_id:
+        namespace = await _validate_token(token)
+        if not namespace:
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
-        user_id_ctx.set(user_id)
+        namespace_ctx.set(namespace)
         return await call_next(request)
 
 
@@ -134,20 +134,22 @@ mcp = FastMCP("recall", lifespan=_lifespan)
 async def store_memory(
     text: str,
     topic: str,
-    idempotency_key: str,
+    idempotency_key: str = "",
     session_id: str = "",
     agent_id: str = "",
 ) -> dict:
     """Store conversation messages for background memory extraction.
     Returns immediately — extraction runs async. Safe to retry with the same key."""
-    user_id = user_id_ctx.get()
+    namespace = namespace_ctx.get()
+    if not idempotency_key:
+        idempotency_key = str(uuid.uuid4())
 
     job_id = str(uuid.uuid4())
     async with aiosqlite.connect(get_db_path()) as db:
         cursor = await db.execute(
-            "INSERT OR IGNORE INTO operations (id, idempotency_key, user_id, status) "
+            "INSERT OR IGNORE INTO operations (id, idempotency_key, namespace, status) "
             "VALUES (?,?,?,'queued')",
-            (job_id, idempotency_key, user_id),
+            (job_id, idempotency_key, namespace),
         )
         await db.commit()
         if cursor.rowcount == 0:
@@ -156,7 +158,7 @@ async def store_memory(
     if extraction_worker:
         await extraction_worker.enqueue({
             "job_id": job_id,
-            "user_id": user_id,
+            "namespace": namespace,
             "text": text,
             "topic": topic,
             "session_id": session_id,
@@ -186,9 +188,9 @@ async def search_memories(
         return {"status": "error", "error": "recency_weight must be between 0.0 and 1.0.", "code": "INVALID_PARAM"}
     if not 0.0 <= mmr_lambda <= 1.0:
         return {"status": "error", "error": "mmr_lambda must be between 0.0 and 1.0.", "code": "INVALID_PARAM"}
-    user_id = user_id_ctx.get()
+    namespace = namespace_ctx.get()
     results = await _hybrid_search(
-        user_id, query, min(limit, 50), recency_weight, mmr_lambda, score_threshold
+        namespace, query, min(limit, 50), recency_weight, mmr_lambda, score_threshold
     )
     if max_tokens is not None:
         results = _apply_budget(results, max_tokens)
@@ -199,18 +201,18 @@ async def search_memories(
 async def inspect_memories(limit: int = 20, offset: int = 0) -> dict:
     """List stored memories with pagination. Default 20 per page, max 50."""
     limit = min(limit, 50)
-    user_id = user_id_ctx.get()
+    namespace = namespace_ctx.get()
 
     async with aiosqlite.connect(get_db_path()) as db:
         rows = await db.execute_fetchall(
             "SELECT id, text, topic, importance, type, created_at "
-            "FROM memories WHERE user_id = ? AND valid_until IS NULL "
+            "FROM memories WHERE namespace = ? AND valid_until IS NULL "
             "ORDER BY created_at DESC LIMIT ? OFFSET ?",
-            (user_id, limit, offset),
+            (namespace, limit, offset),
         )
         count = await db.execute_fetchall(
-            "SELECT COUNT(*) FROM memories WHERE user_id = ? AND valid_until IS NULL",
-            (user_id,),
+            "SELECT COUNT(*) FROM memories WHERE namespace = ? AND valid_until IS NULL",
+            (namespace,),
         )
         total = count[0][0]
 
@@ -240,12 +242,12 @@ async def inspect_memories(limit: int = 20, offset: int = 0) -> dict:
 @mcp.tool()
 async def delete_memory(memory_id: str) -> dict:
     """Permanently delete a memory by ID. This action cannot be undone."""
-    user_id = user_id_ctx.get()
+    namespace = namespace_ctx.get()
 
     async with aiosqlite.connect(get_db_path()) as db:
         cursor = await db.execute(
-            "DELETE FROM memories WHERE id = ? AND user_id = ?",
-            (memory_id, user_id),
+            "DELETE FROM memories WHERE id = ? AND namespace = ?",
+            (memory_id, namespace),
         )
         await db.commit()
         if cursor.rowcount == 0:
@@ -264,17 +266,17 @@ async def delete_memory(memory_id: str) -> dict:
 @mcp.tool()
 async def get_memory_stats() -> dict:
     """Return memory counts and storage stats for the current user. Fast health check."""
-    user_id = user_id_ctx.get()
+    namespace = namespace_ctx.get()
 
     async with aiosqlite.connect(get_db_path()) as db:
         by_type = await db.execute_fetchall(
             "SELECT type, COUNT(*) FROM memories "
-            "WHERE user_id = ? AND valid_until IS NULL GROUP BY type",
-            (user_id,),
+            "WHERE namespace = ? AND valid_until IS NULL GROUP BY type",
+            (namespace,),
         )
         pending = await db.execute_fetchall(
-            "SELECT COUNT(*) FROM operations WHERE user_id = ? AND status = 'queued'",
-            (user_id,),
+            "SELECT COUNT(*) FROM operations WHERE namespace = ? AND status = 'queued'",
+            (namespace,),
         )
 
     return {
@@ -296,7 +298,7 @@ async def consolidate_memories(
 ) -> dict:
     """Find semantically similar memories in a topic and merge them into canonical facts.
     Requires embeddings extra: pip install 'szl-recall[embeddings]'. Returns a diff."""
-    user_id = user_id_ctx.get()
+    namespace = namespace_ctx.get()
 
     # Check embeddings available before any DB work
     from recall.embeddings import embed
@@ -312,9 +314,9 @@ async def consolidate_memories(
     async with aiosqlite.connect(get_db_path()) as db:
         rows = await db.execute_fetchall(
             "SELECT id, text, type, importance "
-            "FROM memories WHERE user_id = ? AND topic = ? AND valid_until IS NULL "
+            "FROM memories WHERE namespace = ? AND topic = ? AND valid_until IS NULL "
             "ORDER BY created_at DESC",
-            (user_id, topic),
+            (namespace, topic),
         )
 
     if not rows:
@@ -397,15 +399,15 @@ async def consolidate_memories(
         for merged in created_memories:
             new_id = str(uuid.uuid4())
             await db.execute(
-                "INSERT INTO memories (id, user_id, text, type, topic, importance, created_at, valid_from) "
+                "INSERT INTO memories (id, namespace, text, type, topic, importance, created_at, valid_from) "
                 "VALUES (?,?,?,?,?,?,?,?)",
-                (new_id, user_id, merged["text"], merged["type"], topic, merged["importance"], now, now),
+                (new_id, namespace, merged["text"], merged["type"], topic, merged["importance"], now, now),
             )
             persisted.append({"id": new_id, "text": merged["text"], "type": merged["type"], "topic": topic})
         for del_id in deleted_ids:
             await db.execute(
-                "UPDATE memories SET valid_until = ? WHERE id = ? AND user_id = ?",
-                (now, del_id, user_id),
+                "UPDATE memories SET valid_until = ? WHERE id = ? AND namespace = ?",
+                (now, del_id, namespace),
             )
         await db.commit()
 
@@ -424,7 +426,7 @@ async def consolidate_memories(
 
 
 @mcp.tool()
-async def delete_user_data(confirm: str) -> dict:
+async def delete_namespace_data(confirm: str) -> dict:
     """Permanently delete ALL data for the current user. Irreversible.
 
     Pass confirm='DELETE MY DATA' exactly to proceed.
@@ -437,17 +439,17 @@ async def delete_user_data(confirm: str) -> dict:
             "error": "Pass confirm='DELETE MY DATA' exactly to proceed.",
             "code": "CONFIRM_REQUIRED",
         }
-    user_id = user_id_ctx.get()
+    namespace = namespace_ctx.get()
     async with aiosqlite.connect(get_db_path()) as db:
-        await db.execute("DELETE FROM memories WHERE user_id = ?", (user_id,))
-        await db.execute("DELETE FROM a2a_tasks WHERE user_id = ?", (user_id,))
-        await db.execute("DELETE FROM operations WHERE user_id = ?", (user_id,))
+        await db.execute("DELETE FROM memories WHERE namespace = ?", (namespace,))
+        await db.execute("DELETE FROM a2a_tasks WHERE namespace = ?", (namespace,))
+        await db.execute("DELETE FROM operations WHERE namespace = ?", (namespace,))
         await db.execute(
-            "DELETE FROM tool_call_records WHERE user_id = ? AND tool_name != 'delete_user_data'",
-            (user_id,),
+            "DELETE FROM tool_call_records WHERE namespace = ? AND tool_name != 'delete_namespace_data'",
+            (namespace,),
         )
         r = await db.execute(
-            "UPDATE api_tokens SET revoked = 1 WHERE user_id = ?", (user_id,)
+            "UPDATE api_tokens SET revoked = 1 WHERE namespace = ?", (namespace,)
         )
         tokens_revoked = r.rowcount
         await db.commit()
@@ -467,7 +469,7 @@ async def _validate_token(token: str) -> str | None:
     db_path = get_db_path()
     async with aiosqlite.connect(db_path) as db:
         rows = await db.execute_fetchall(
-            "SELECT user_id FROM api_tokens WHERE token_hash = ? AND revoked = 0",
+            "SELECT namespace FROM api_tokens WHERE token_hash = ? AND revoked = 0",
             (token_hash,),
         )
     return rows[0][0] if rows else None
@@ -529,15 +531,20 @@ def _mmr_rerank(
     query_vec: "np.ndarray | None",
     mmr_lambda: float,
     limit: int,
+    hybrid_scores: "list[float] | None" = None,
 ) -> list[dict]:
     """Max-Marginal Relevance reranking for diversity.
 
     Iteratively selects the candidate that maximises:
-      mmr_lambda * sim(query, doc) - (1 - mmr_lambda) * max(sim(doc, selected))
+      mmr_lambda * relevance(doc) - (1 - mmr_lambda) * max(embed_sim(doc, selected))
+
+    relevance(doc) = hybrid_scores[i] when provided, else cosine similarity to query.
+    Using hybrid_scores means mmr_lambda=1.0 preserves the full decay/recency/importance
+    ordering from the hybrid ranker, rather than collapsing to pure embedding similarity.
 
     Falls back to candidates[:limit] when embeddings are unavailable.
     """
-    if query_vec is None or len(candidates) <= limit:
+    if query_vec is None:
         return candidates[:limit]
 
     from recall.embeddings import embed
@@ -547,7 +554,12 @@ def _mmr_rerank(
     if doc_vecs is None:
         return candidates[:limit]
 
-    q_sims = (doc_vecs @ query_vec).tolist()
+    # Relevance signal: normalised hybrid scores when available, otherwise cosine similarity
+    if hybrid_scores is not None:
+        max_s = max(hybrid_scores) or 1.0
+        rel_scores = [s / max_s for s in hybrid_scores]
+    else:
+        rel_scores = (doc_vecs @ query_vec).tolist()
 
     selected: list[int] = []
     remaining = list(range(len(candidates)))
@@ -556,7 +568,7 @@ def _mmr_rerank(
         best_i, best_score = None, float("-inf")
         for i in remaining:
             redundancy = float(np.max(doc_vecs[selected] @ doc_vecs[i])) if selected else 0.0
-            mmr_score = mmr_lambda * q_sims[i] - (1.0 - mmr_lambda) * redundancy
+            mmr_score = mmr_lambda * rel_scores[i] - (1.0 - mmr_lambda) * redundancy
             if mmr_score > best_score:
                 best_score, best_i = mmr_score, i
         if best_i is None:
@@ -677,7 +689,7 @@ def _apply_budget(memories: list[dict], max_tokens: int) -> list[dict]:
 
 
 async def _hybrid_search(
-    user_id: str,
+    namespace: str,
     query: str,
     limit: int,
     recency_weight: float = 0.3,
@@ -702,9 +714,9 @@ async def _hybrid_search(
     async with aiosqlite.connect(get_db_path()) as db:
         rows = await db.execute_fetchall(
             "SELECT id, text, topic, importance, type, created_at, access_count, decay_score "
-            "FROM memories WHERE user_id = ? AND valid_until IS NULL "
+            "FROM memories WHERE namespace = ? AND valid_until IS NULL "
             "ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit * 5),
+            (namespace, limit * 5),
         )
 
     if not rows:
@@ -753,11 +765,14 @@ async def _hybrid_search(
     scored.sort(key=lambda x: x[0], reverse=True)
 
     # Pre-MMR pool: top limit*3 candidates, filtered by score_threshold
-    pre_mmr = [m for s, m in scored[: limit * 3] if s >= score_threshold]
+    pre_mmr_scored = [(s, m) for s, m in scored[: limit * 3] if s >= score_threshold]
+    pre_mmr = [m for _, m in pre_mmr_scored]
+    pre_mmr_scores = [s for s, _ in pre_mmr_scored]
 
     # MMR diversification — embed_query is fast (model already warm from _dense_ranks)
+    # Pass hybrid scores so mmr_lambda=1.0 preserves full decay/recency ordering.
     from recall.embeddings import embed_query as _eq
-    results = _mmr_rerank(pre_mmr, _eq(query), mmr_lambda, limit)
+    results = _mmr_rerank(pre_mmr, _eq(query), mmr_lambda, limit, hybrid_scores=pre_mmr_scores)
 
     # Update access tracking for returned memories
     if results:
@@ -784,10 +799,10 @@ def create_app():
     from recall.a2a import create_a2a_router, create_well_known_router
 
     app = mcp.http_app(transport="streamable-http")
-    app.mount("/a2a", create_a2a_router(user_id_ctx))
+    app.mount("/a2a", create_a2a_router(namespace_ctx))
     app.mount("/.well-known", create_well_known_router())
     # Starlette applies middleware in reverse order — LoggingMiddleware runs outermost (sees full duration)
-    app.add_middleware(LoggingMiddleware, user_id_ctx=user_id_ctx)
+    app.add_middleware(LoggingMiddleware, namespace_ctx=namespace_ctx)
     app.add_middleware(TimeoutMiddleware)
     app.add_middleware(BearerAuthMiddleware)
     return app

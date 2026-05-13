@@ -5,7 +5,7 @@ PostgresBackend wraps asyncpg with connection pooling and automatic ? → $N tra
 
 Usage:
     async with get_backend() as db:
-        rows = await db.fetch_all("SELECT id FROM memories WHERE user_id = ?", (uid,))
+        rows = await db.fetch_all("SELECT id FROM memories WHERE namespace = ?", (uid,))
         await db.execute("UPDATE memories SET ...", (...,))
         await db.commit()
 

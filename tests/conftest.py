@@ -35,7 +35,7 @@ async def client(tmp_db: Path) -> MemoryClient:
 
 
 @pytest.fixture
-def user_id() -> str:
+def namespace() -> str:
     return "test-user-abc123"
 
 

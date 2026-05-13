@@ -22,13 +22,13 @@ _needs_api = pytest.mark.skipif(
 
 @_needs_api
 class TestExtraction:
-    async def test_extract_returns_typed_memories(self, client, user_id):
+    async def test_extract_returns_typed_memories(self, client, namespace):
         """LLM extraction returns structurally valid memories — asserts schema, not content."""
         worker = ExtractionWorker()
         await worker.start()
         try:
             memories = await worker.extract(
-                user_id=user_id,
+                namespace=namespace,
                 text=(
                     "I prefer Python over Go for backend services. "
                     "I always write tests before shipping."
@@ -47,7 +47,7 @@ class TestExtraction:
             assert 0.0 <= m["confidence"] <= 1.0
             assert len(m["text"]) > 0
 
-    async def test_full_pipeline_stores_memories_to_db(self, client, user_id, tmp_db):
+    async def test_full_pipeline_stores_memories_to_db(self, client, namespace, tmp_db):
         """Queue → worker → DB path: enqueue a job, poll until memories persist (15s max)."""
         from recall.db.connection import set_db_path
         set_db_path(tmp_db)
@@ -57,7 +57,7 @@ class TestExtraction:
         job_id = str(uuid.uuid4())
         await worker.enqueue({
             "job_id": job_id,
-            "user_id": user_id,
+            "namespace": namespace,
             "text": (
                 "I always use type hints in Python. "
                 "FastAPI is my preferred framework for new services."
@@ -68,7 +68,7 @@ class TestExtraction:
         memories = []
         for _ in range(50):
             await asyncio.sleep(0.3)
-            memories, _ = await client.list_all(user_id)
+            memories, _ = await client.list_all(namespace)
             if memories:
                 break
 
@@ -83,7 +83,7 @@ class TestStubFallback:
         assert len(memories) == 1
         assert memories[0]["type"] == "fact"
         assert memories[0]["text"] == "Some raw conversation text"
-        assert memories[0]["user_id"] == "u1"
+        assert memories[0]["namespace"] == "u1"
 
     async def test_stub_fallback_truncates_long_text(self):
         long_text = "x" * 1000

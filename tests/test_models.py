@@ -11,7 +11,7 @@ from recall.models import MemoryType, MemoryUnit
 def make_memory(**kwargs) -> MemoryUnit:
     defaults = {
         "id": "test-id-001",
-        "user_id": "user-abc",
+        "namespace": "user-abc",
         "text": "User prefers dark mode",
         "type": MemoryType.PREFERENCE,
         "topic": "ui_preferences",
@@ -75,7 +75,7 @@ class TestMemoryUnit:
         m = make_memory()
         d = m.to_dict()
         expected_keys = {
-            "id", "user_id", "text", "type", "topic", "importance", "confidence",
+            "id", "namespace", "text", "type", "topic", "importance", "confidence",
             "source_session", "created_at", "last_accessed", "access_count",
             "decay_score", "superseded_by", "embedding",
         }

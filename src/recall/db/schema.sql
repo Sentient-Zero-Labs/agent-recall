@@ -22,7 +22,7 @@ VALUES (1, datetime('now'), 'Initial schema — memories + tool_call_records');
 
 CREATE TABLE IF NOT EXISTS memories (
     id              TEXT PRIMARY KEY,
-    user_id         TEXT NOT NULL,
+    namespace         TEXT NOT NULL,
     text            TEXT NOT NULL,
     type            TEXT NOT NULL,          -- preference|fact|decision|procedure
     topic           TEXT,
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE TABLE IF NOT EXISTS tool_call_records (
     id              TEXT PRIMARY KEY,
     tool_name       TEXT NOT NULL,
-    user_id         TEXT NOT NULL,
+    namespace         TEXT NOT NULL,
     session_id      TEXT NOT NULL,
     inputs_hash     TEXT NOT NULL,          -- sha256 of canonicalised inputs
     status          TEXT NOT NULL,          -- success|error|timeout
@@ -70,20 +70,20 @@ CREATE TABLE IF NOT EXISTS tool_call_records (
 -- ------------------------------------------------------------------ --
 
 CREATE INDEX IF NOT EXISTS idx_memories_user
-    ON memories(user_id);
+    ON memories(namespace);
 
 CREATE INDEX IF NOT EXISTS idx_memories_user_type
-    ON memories(user_id, type);
+    ON memories(namespace, type);
 
 CREATE INDEX IF NOT EXISTS idx_memories_created
     ON memories(created_at);
 
 CREATE INDEX IF NOT EXISTS idx_memories_entity_attr
-    ON memories(user_id, entity, attribute)
+    ON memories(namespace, entity, attribute)
     WHERE valid_until IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_user_session
-    ON tool_call_records(user_id, session_id);
+    ON tool_call_records(namespace, session_id);
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_timestamp
     ON tool_call_records(timestamp);
@@ -98,14 +98,14 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name
 CREATE TABLE IF NOT EXISTS operations (
     id              TEXT PRIMARY KEY,
     idempotency_key TEXT UNIQUE NOT NULL,
-    user_id         TEXT NOT NULL,
+    namespace         TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'queued', -- queued|processing|complete|failed
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_operations_user
-    ON operations(user_id);
+    ON operations(namespace);
 
 CREATE INDEX IF NOT EXISTS idx_operations_status
     ON operations(status);
@@ -117,7 +117,7 @@ CREATE INDEX IF NOT EXISTS idx_operations_status
 CREATE TABLE IF NOT EXISTS api_tokens (
     id          TEXT PRIMARY KEY,
     token_hash  TEXT UNIQUE NOT NULL,   -- sha256 of the raw token
-    user_id     TEXT NOT NULL,
+    namespace     TEXT NOT NULL,
     revoked     INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -131,7 +131,7 @@ CREATE INDEX IF NOT EXISTS idx_api_tokens_hash
 
 CREATE TABLE IF NOT EXISTS a2a_tasks (
     id          TEXT PRIMARY KEY,
-    user_id     TEXT NOT NULL,
+    namespace     TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'submitted',  -- submitted|working|input-required|completed|failed
     input       TEXT NOT NULL,                      -- JSON: {text, topic}
     output      TEXT,                               -- JSON blob, NULL until completed
@@ -142,4 +142,4 @@ CREATE TABLE IF NOT EXISTS a2a_tasks (
     updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_a2a_user ON a2a_tasks(user_id);
+CREATE INDEX IF NOT EXISTS idx_a2a_user ON a2a_tasks(namespace);

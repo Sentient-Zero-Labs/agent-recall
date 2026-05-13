@@ -86,7 +86,7 @@ recall serve --port 8000
 recall create-token my-agent --db recall.db
 
 #   Output:
-#     Token created for user: my-agent
+#     Token created for namespace: my-agent
 #
 #       Bearer <token>
 #
@@ -109,11 +109,11 @@ recall create-token my-agent --db recall.db
 }
 ```
 
-Restart Claude Desktop. Recall's six tools are now available in every conversation.
+Restart Claude Desktop. Recall's seven tools are now available in every conversation.
 
 ---
 
-## Six MCP tools
+## Seven MCP tools
 
 ### `store_memory`
 
@@ -136,19 +136,24 @@ Returns:
 
 ### `search_memories`
 
-Hybrid retrieval over all stored memories for the authenticated user.
+Hybrid retrieval over all stored memories for the authenticated namespace.
 
 ```
 Arguments:
   query          str     — natural language query
   limit          int     — max results (default 20, hard cap 50)
-  recency_weight float   — 0.0–1.0 (default 0.3); higher values surface newer memories
+  recency_weight float   — 0.0–1.0 (default 0.3); higher surfaces newer memories
+  mmr_lambda     float   — 0.0–1.0 (default 0.5); 0=max diversity, 1=pure relevance
+  score_threshold float  — drop candidates below this hybrid score (default 0.0)
+  max_tokens     int     — optional token budget; trims results to fit (4 chars/token)
 
 Returns:
   {status: "ok", data: {results: [...memories], total: N}}
 ```
 
 Each result includes: `id`, `text`, `topic`, `type`, `importance`, `created_at`.
+
+**MMR diversification**: when `sentence-transformers` is installed, results are reranked using Max-Marginal Relevance so near-duplicate memories don't all crowd the top slots. Set `mmr_lambda=0.3` for high diversity, `mmr_lambda=1.0` to disable.
 
 ### `inspect_memories`
 
@@ -220,6 +225,21 @@ Returns:
 ```
 
 **What happens**: active memories in the topic are embedded, clustered by cosine similarity, and each cluster is sent to Claude Haiku for a merge pass. Original memories are superseded (`valid_until` set); a single canonical memory is written in their place.
+
+### `delete_namespace_data`
+
+Permanently deletes ALL data for the authenticated namespace. Irreversible. Requires exact confirmation string.
+
+```
+Arguments:
+  confirm  str  — must be exactly "DELETE MY DATA" to proceed
+
+Returns:
+  {status: "ok", data: {tokens_revoked: N}}
+  {status: "error", code: "CONFIRM_REQUIRED"}
+```
+
+**What happens**: deletes all memories, operations, A2A tasks, and tool call records for the namespace. Revokes all API tokens. Subsequent requests with any token for this namespace will return 401.
 
 ---
 
@@ -316,7 +336,7 @@ POST /a2a/<task_id>/resume
 
 **Key invariants:**
 
-- Every DB operation is scoped to `user_id` — injected via `ContextVar` from auth middleware, never passed as a tool argument.
+- Every DB operation is scoped to `namespace` — injected via `ContextVar` from auth middleware, never passed as a tool argument. A namespace can represent a user, agent, project, or any string identity.
 - `store_memory` is idempotent: `INSERT OR IGNORE` + `rowcount` check makes concurrent retries safe.
 - Active memories are always `WHERE valid_until IS NULL`. Superseded facts remain in the DB (for audit) but are excluded from all queries.
 - On server restart, `_recover_orphaned_operations()` marks any stuck jobs as `failed` to prevent ghost jobs.
@@ -325,15 +345,16 @@ POST /a2a/<task_id>/resume
 
 ## Database schema
 
-Five tables in `recall.db`:
+Six tables in `recall.db`:
 
 | Table | Purpose |
 |---|---|
 | `memories` | Core store. Active rows have `valid_until IS NULL`. |
 | `operations` | Idempotency + job lifecycle tracking for async extraction. |
-| `api_tokens` | SHA-256 hashed bearer tokens per user. |
+| `api_tokens` | SHA-256 hashed bearer tokens per namespace. |
 | `tool_call_records` | Structured audit log for every tool call (duration, tokens, cost). |
 | `schema_version` | Migration tracking. |
+| `a2a_tasks` | Persistent A2A task store. Survives server restart. |
 
 **Key `memories` columns:**
 
@@ -358,6 +379,9 @@ Five tables in `recall.db`:
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | Yes | — | Claude Haiku for background extraction |
 | `RECALL_DB_PATH` | No | `recall.db` | Path to SQLite database file |
+| `RECALL_DB_URL` | No | — | Postgres DSN (e.g. `postgresql://user:pass@localhost/recall`). If set, uses Postgres instead of SQLite. |
+| `RECALL_DECAY_LAMBDA` | No | `0.02` | Decay rate — ~35-day half-life at default. |
+| `RECALL_DECAY_JOB_INTERVAL` | No | `3600` | Seconds between decay runs. |
 
 ---
 
@@ -376,6 +400,10 @@ pytest tests/ -v
 # Fast tests only — no API key needed (~2s)
 pytest tests/test_search.py tests/test_server.py tests/test_client.py tests/test_models.py -v
 
+# With embeddings (requires sentence-transformers)
+pip install -e ".[dev,embeddings]"
+pytest tests/test_mmr.py -v   # MMR deduplication + diversity tests
+
 # Live extraction tests (~8s)
 ANTHROPIC_API_KEY=sk-ant-... pytest tests/test_worker.py -v -s
 ```
@@ -389,6 +417,12 @@ ANTHROPIC_API_KEY=sk-ant-... pytest tests/test_worker.py -v -s
 | `test_server.py` | HTTP layer — auth, MCP routing, response shapes, error codes |
 | `test_search.py` | Search correctness (superseded filtering, idempotency) + ranking behavior |
 | `test_worker.py` | Extraction pipeline — Haiku output structure, queue→DB path, stub fallback |
+| `test_mmr.py` | MMR reranking, diversity, score_threshold, fallback |
+| `test_budget.py` | Context budget trimming (`max_tokens`) |
+| `test_gdpr.py` | `delete_namespace_data` — wrong confirm, full erasure, token revocation |
+| `test_postgres_backend.py` | DB backend abstraction, placeholder translation, factory |
+| `test_decay.py` | DecayWorker — decay scoring, access-count protection, run_once count |
+| `test_consolidation.py` | `consolidate_memories` — clustering, LLM merge, dry-run mode |
 
 ---
 
@@ -396,22 +430,27 @@ ANTHROPIC_API_KEY=sk-ant-... pytest tests/test_worker.py -v -s
 
 ```bash
 recall serve [--host 0.0.0.0] [--port 8000] [--db recall.db] [--reload]
-recall create-token <user_id> [--db recall.db]
+recall create-token <namespace> [--db recall.db]
 recall status [--db recall.db]
 ```
+
+`<namespace>` can be any string: `alice`, `agent:code-reviewer-v2`, `project:payments`, etc.
+
+Note: `--db` flag on `recall serve` now correctly overrides `RECALL_DB_PATH` env var.
 
 ---
 
 ## Version history
 
-- **v0.3** (current): Memory decay scoring (`DecayWorker`, exponential decay with access-count protection), `consolidate_memories` MCP tool (6th tool, embedding-based clustering + LLM merge), access_count increment fix in hybrid search, 59-test suite.
-- **v0.2**: Hybrid BM25Plus+RRF search, 4-component scoring, structured fact extraction (entity/attribute/value), deterministic contradiction detection, A2A consolidation worker, 48-test suite.
+- **v0.3.3** (current): `user_id` renamed to `namespace` — tokens, DB columns, and all queries. Namespace can be a user, agent (`agent:code-reviewer-v2`), project, or any string. DB migration runs automatically on startup. MMR bug fix: relevance signal now uses hybrid scores (recency + decay + BM25 + density) instead of raw cosine, so `mmr_lambda=1.0` correctly preserves full ranking order.
+- **v0.3.0–v0.3.2**: MMR diversification (`mmr_lambda` param), context budget trimming (`max_tokens`), GDPR erasure (`delete_namespace_data`, 7th tool), A2A task persistence (survives restarts), Postgres backend (`RECALL_DB_URL`), `--db` CLI bug fix, TROUBLESHOOTING.md, sentence-transformers 5.5.0 validated.
+- **v0.2**: Hybrid BM25Plus+RRF search, 4-component scoring, structured fact extraction (entity/attribute/value), deterministic contradiction detection, A2A consolidation worker.
 - **v0.1**: SQLite + BM25 search, 5 MCP tools, async extraction via Claude Haiku, bearer auth.
 
 **Roadmap:**
-- Postgres backend + pgvector for production deployments
-- Multi-user admin API
+- Multi-namespace admin API (list/delete namespaces)
 - Webhook notifications on extraction completion
+- `owner_id + agent_id` composite isolation for agent-per-user memory separation (v0.4)
 
 ---
 
